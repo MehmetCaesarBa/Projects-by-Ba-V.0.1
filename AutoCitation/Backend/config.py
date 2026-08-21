@@ -37,7 +37,7 @@ OLLAMA_TAGS_URL: str     = f"{OLLAMA_BASE_URL}/api/tags"
 # model up to MAX_ITERATIONS times per input paragraph, so inference
 # speed directly determines end-to-end latency more than accuracy does
 # at this stage.
-FAST_MODEL: str = "phi3:mini"
+FAST_MODEL: str = "autocitation-extractor"
 
 # REASONING_MODEL: Larger reasoning model used by verifier.py.
 # Selected for deeper chain-of-thought capability needed to classify a
@@ -56,3 +56,4 @@ REASONING_MODEL: str = "qwen3:8b"
 # window. Inputs beyond this limit would require chunking the input itself,
 # which is out of scope for the PoC.
 MAX_INPUT_WORDS: int = 500
+

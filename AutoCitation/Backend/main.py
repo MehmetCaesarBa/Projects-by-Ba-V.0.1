@@ -1,3 +1,4 @@
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -6,9 +7,6 @@ from pydantic import BaseModel, field_validator
 
 import models.ollama_client as ollama_client
 import Pipeline.claim_extractor as claim_extractor
-import Pipeline.ner as ner
-import Pipeline.retriever as retriever
-import Pipeline.verifier as verifier
 import Pipeline.postprocessor as postprocessor
 from config import MAX_INPUT_WORDS
 
@@ -76,6 +74,8 @@ class FactResult(BaseModel):
     rationale   : str
     evidence    : str
     source_url  : str
+    # Per-stage durations in seconds: extraction_s, retrieval_s, verification_s
+    timings     : dict[str, float] = {}
 
 
 class SummaryBlock(BaseModel):
@@ -107,6 +107,9 @@ class CheckResponse(BaseModel):
     overall_label : str
     summary       : dict[str, int]
     results       : list[FactResult]
+    # Aggregated stage durations (extraction_s, retrieval_s, verification_s)
+    # plus total_s — wall-clock time for the whole request.
+    timings       : dict[str, float] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,86 +178,19 @@ app.add_middleware(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 — Per-Fact Pipeline Runner
+# STEP 4 — (removed) Per-Fact Pipeline Runner
 # ─────────────────────────────────────────────────────────────────────────────
-def run_fact_pipeline(fact: str) -> dict:
-    """
-    Executes the full retrieval-verification pipeline for a single atomic fact.
-
-    Called once per fact inside the /check endpoint's fact loop. Isolating
-    per-fact logic here keeps the endpoint handler readable and makes each
-    stage independently traceable in logs.
-
-    Pipeline stages for one fact:
-        1. ner.extract_query()      → search string for Wikipedia + postprocessor URL
-        2. retriever.fetch()        → top-k evidence chunks (may be empty)
-        3. verifier.verify()        → label, rationale, evidence chunk
-
-    Wikipedia-miss handling (empty chunks):
-    If retriever.fetch() returns an empty list — because Wikipedia found no
-    relevant articles for the NER query — verifier.verify() is still called
-    with an empty evidence list. The verifier's prompt instructs it to output
-    NOT ENOUGH INFO when no evidence is available, which is the correct and
-    honest response: the system cannot support or refute a claim it found no
-    source for. Skipping the fact entirely would silently reduce the result
-    count and misrepresent how many claims were actually checked.
-
-    NER double-call note:
-    ner.extract_query() is called here explicitly (in addition to the
-    internal call inside retriever.fetch()) so that main.py can capture
-    the query string and pass it to postprocessor.assemble_result() for
-    Wikipedia URL resolution. The NER step is pure CPU/spaCy with no model
-    inference cost, so the duplicate call adds negligible latency at PoC scale.
-    A future refactor of retriever.fetch() to return (chunks, query) as a
-    tuple would eliminate this duplication.
-
-    Args:
-        fact : atomic claim string from claim_extractor.run()
-
-    Returns:
-        Raw pipeline output dict with keys:
-            claim, label, rationale, evidence, ner_query
-        Ready to be passed into postprocessor.process().
-
-    Raises:
-        Does not raise — any exception from retriever or verifier is caught
-        and converted into a NOT ENOUGH INFO result so one failing fact does
-        not abort the entire /check response.
-    """
-    print(f"\n[Main] Running pipeline for fact: '{fact}'")
-
-    # Stage 1 — NER query (captured here for postprocessor URL resolution)
-    ner_query = ner.extract_query(fact)
-
-    # Stage 2 — Wikipedia retrieval (empty list on miss; handled in Stage 3)
-    try:
-        chunks = retriever.fetch(fact)
-    except Exception as e:
-        print(f"[Main] Retriever failed for fact '{fact}': {e}")
-        chunks = []
-
-    if not chunks:
-        print(
-            f"[Main] No evidence chunks retrieved for fact '{fact}'. "
-            f"Proceeding to verifier — will yield NOT ENOUGH INFO."
-        )
-
-    # Stage 3 — Verification (called regardless of chunk availability)
-    try:
-        label, rationale, evidence = verifier.verify(fact, chunks)
-    except Exception as e:
-        print(f"[Main] Verifier failed for fact '{fact}': {e}")
-        label     = "NOT ENOUGH INFO"
-        rationale = "Verification could not be completed due to an internal error."
-        evidence  = ""
-
-    return {
-        "claim"     : fact,
-        "label"     : label,
-        "rationale" : rationale,
-        "evidence"  : evidence,
-        "ner_query" : ner_query,
-    }
+# Retrieval + verification now happen inside claim_extractor's AFEV loop
+# (grounded_verify) — the paper's intended design: each fact is verified
+# against Wikipedia evidence the moment it is extracted, and that verified
+# result doubles as the feedback signal for the next extraction iteration.
+#
+# The second verification pass that used to live here duplicated work and,
+# worse, produced inconsistent verdicts: the loop's feedback came from
+# phi3's world knowledge while the final label came from qwen against
+# evidence — two different judgments of the same fact. The world-knowledge
+# rationales were also the channel through which fabricated entities leaked
+# into extracted claims.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -307,10 +243,14 @@ def check(request: CheckRequest) -> CheckResponse:
             → postprocessor.process()        # assemble + aggregate → response
     """
     print(f"\n[Main] POST /check — received {len(request.text.split())} words.")
+    t_start = time.perf_counter()
 
-    # ── Stage 1: Claim Extraction ─────────────────────────────────────────────
+    # ── Stage 1+2: Claim Extraction with Grounded Verification ───────────────
+    # claim_extractor.run() returns fully verified per-fact result dicts
+    # (claim, label, rationale, evidence, ner_query, source_url) — retrieval
+    # and verification run inside the AFEV loop; see the STEP 4 note above.
     try:
-        facts = claim_extractor.run(request.text)
+        pipeline_outputs = claim_extractor.run(request.text)
     except Exception as e:
         print(f"[Main] Claim extraction raised an unexpected exception: {e}")
         raise HTTPException(
@@ -318,30 +258,31 @@ def check(request: CheckRequest) -> CheckResponse:
             detail      = f"Claim extraction failed: {e}"
         )
 
-    if not facts:
-        # precondition() returned None (bad characters / word count) or
-        # the extraction loop produced zero facts from the input.
-        raise HTTPException(
-            status_code = 503,
-            detail      = (
-                "No verifiable claims could be extracted from the input. "
-                "Check that the text is within 500 words and contains "
-                "factual statements rather than only opinions or questions."
-            )
-        )
+    if not pipeline_outputs:
+        # "Nothing checkable here" is a RESULT, not a server fault.
+        #
+        # This used to raise 503 Service Unavailable, which tells the client the
+        # backend is down and makes the frontend render an outage. But zero
+        # facts is a perfectly ordinary outcome: text that is entirely opinion,
+        # or whose only claims the extractor could not decontextualize, is
+        # correctly answered with "no verifiable claims found". Returning 200
+        # with an empty claim list lets the UI say that, and keeps genuine
+        # 5xx codes meaningful for genuine outages.
+        print("[Main] No verifiable claims extracted — returning empty result set.")
+        elapsed = time.perf_counter() - t_start
+        return {
+            "claims"        : [],
+            "overall_label" : "NO CLAIMS",
+            "summary"       : {"SUPPORTS": 0, "REFUTES": 0, "NOT ENOUGH INFO": 0},
+            "message"       : (
+                "No verifiable claims could be extracted from the input. This "
+                "happens when the text is opinion rather than fact, or when its "
+                "statements depend on context the text does not supply."
+            ),
+            "elapsed_s"     : round(elapsed, 2),
+        }
 
-    print(f"[Main] {len(facts)} fact(s) extracted. Starting per-fact pipeline.")
-
-    # ── Stage 2: Per-Fact Retrieval + Verification ────────────────────────────
-    # Facts are processed sequentially. A parallel implementation (asyncio
-    # gather or a thread pool) would reduce latency on multi-fact inputs but
-    # is deferred until the PoC baseline is validated — concurrent Ollama
-    # calls on a single GPU would queue anyway and offer no real speedup
-    # until a multi-GPU or batched inference setup is in place.
-    pipeline_outputs = []
-    for fact in facts:
-        result = run_fact_pipeline(fact)
-        pipeline_outputs.append(result)
+    print(f"[Main] {len(pipeline_outputs)} verified fact(s) extracted.")
 
     # ── Stage 3: Post-Processing ──────────────────────────────────────────────
     try:
@@ -353,10 +294,28 @@ def check(request: CheckRequest) -> CheckResponse:
             detail      = f"Post-processing failed: {e}"
         )
 
+    # Attach total wall-clock time; per-stage totals were computed by
+    # postprocessor.aggregate() from the per-fact timing data.
+    final_response.setdefault("timings", {})["total_s"] = round(
+        time.perf_counter() - t_start, 2
+    )
+
     print(
         f"[Main] /check complete — "
         f"{final_response['total_claims']} claim(s) | "
-        f"overall: {final_response['overall_label']}"
+        f"overall: {final_response['overall_label']} | "
+        f"{final_response['timings']['total_s']}s total"
     )
 
     return final_response
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6 — Direct Execution Entry Point
+# ─────────────────────────────────────────────────────────────────────────────
+# Allows starting the server with `python main.py` (from the Backend folder)
+# as an alternative to `uvicorn main:app --port 8000`. Port 8000 matches the
+# hardcoded API_BASE in Frontend/index.html.
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)

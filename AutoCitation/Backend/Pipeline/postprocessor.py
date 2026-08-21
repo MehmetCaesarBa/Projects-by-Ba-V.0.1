@@ -91,30 +91,41 @@ def resolve_wikipedia_url(query: str) -> str:
     """
     print(f"[Postprocessor] Resolving Wikipedia URL for query: '{query}'")
 
+    # Full-text search (action=query&list=search) instead of opensearch:
+    # opensearch does *prefix* matching on page titles, so multi-entity NER
+    # queries like "Gustave Eiffel Statue of Liberty" never matched any
+    # title and every citation collapsed to the Special:Search fallback.
+    # Full-text search ranks articles by content relevance — the same
+    # engine behind Wikipedia's own search results page.
     params = {
-        "action" : "opensearch",
-        "search" : query,
-        "limit"  : WIKIPEDIA_SEARCH_LIMIT,
-        "format" : "json",
+        "action"   : "query",
+        "list"     : "search",
+        "srsearch" : query,
+        "srlimit"  : WIKIPEDIA_SEARCH_LIMIT,
+        "format"   : "json",
     }
 
     try:
-        response = requests.get(WIKIPEDIA_API_URL, params=params, timeout=5)
+        # Identifying User-Agent per Wikimedia policy — generic UAs get
+        # blocked/rate-limited and return HTML instead of JSON (same failure
+        # mode fixed in retriever.py).
+        headers = {"User-Agent": "AutoCitation/0.1 (PoC fact-checker; contact: mehmet17b.b@gmail.com)"}
+        response = requests.get(WIKIPEDIA_API_URL, params=params, headers=headers, timeout=5)
         response.raise_for_status()
         data = response.json()
 
-        # opensearch returns [query, [titles], [descriptions], [urls]]
-        # Index 3 contains the direct article URLs Wikipedia resolved to.
-        candidate_urls  = data[3] if len(data) > 3 else []
-        candidate_titles = data[1] if len(data) > 1 else []
+        hits = data.get("query", {}).get("search", [])
 
-        for title, url in zip(candidate_titles, candidate_urls):
+        for hit in hits:
+            title = hit.get("title", "")
+
             # Skip disambiguation pages — they link to a list of articles,
             # not a specific factual source, which degrades citation quality.
             if "(disambiguation)" in title.lower():
                 print(f"[Postprocessor] Skipping disambiguation page: '{title}'")
                 continue
 
+            url = WIKIPEDIA_PAGE_BASE + urllib.parse.quote(title.replace(" ", "_"))
             print(f"[Postprocessor] Resolved URL: {url}")
             return url
 
@@ -181,11 +192,13 @@ def normalize_label(raw_label: str) -> str:
 # STEP 3 — Single Result Assembly
 # ─────────────────────────────────────────────────────────────────────────────
 def assemble_result(
-    claim     : str,
-    label     : str,
-    rationale : str,
-    evidence  : str,
-    ner_query : str,
+    claim         : str,
+    label         : str,
+    rationale     : str,
+    evidence      : str,
+    ner_query     : str,
+    retrieved_url : str = "",
+    timings       : dict | None = None,
 ) -> dict:
     """
     Assembles one complete verification result dict for a single atomic fact.
@@ -246,7 +259,12 @@ def assemble_result(
     """
     norm_label  = normalize_label(label)
     label_color = LABEL_COLORS.get(norm_label, "yellow")
-    source_url  = resolve_wikipedia_url(ner_query)
+
+    # Prefer the URL of the article the evidence chunk actually came from
+    # (attached by retriever.fetch). Only fall back to search-based
+    # resolution when retrieval produced no URL — this keeps the citation
+    # and the evidence pointing at the same article.
+    source_url = retrieved_url if retrieved_url else resolve_wikipedia_url(ner_query)
 
     # Truncate evidence for frontend display clarity.
     # Full chunk text is preserved for the label decision but truncated
@@ -265,6 +283,9 @@ def assemble_result(
         "rationale"   : rationale.strip(),
         "evidence"    : display_evidence,
         "source_url"  : source_url,
+        # Per-stage durations in seconds (extraction_s, retrieval_s,
+        # verification_s), measured inside claim_extractor's loop.
+        "timings"     : timings or {},
     }
 
     print(
@@ -365,11 +386,20 @@ def aggregate(raw_results: list[dict]) -> dict:
         # No results at all — claim extraction yielded nothing
         overall_label = "NOT ENOUGH INFO"
 
+    # Stage-time totals across all facts, for the frontend time bar.
+    # total_s (wall clock for the whole request) is attached by main.py.
+    stage_totals = {"extraction_s": 0.0, "retrieval_s": 0.0, "verification_s": 0.0}
+    for result in raw_results:
+        for key in stage_totals:
+            stage_totals[key] += float(result.get("timings", {}).get(key, 0.0))
+    stage_totals = {k: round(v, 2) for k, v in stage_totals.items()}
+
     response = {
         "total_claims"  : len(raw_results),
         "overall_label" : overall_label,
         "summary"       : summary,
         "results"       : raw_results,
+        "timings"       : stage_totals,
     }
 
     print(
@@ -452,11 +482,13 @@ def process(pipeline_outputs: list[dict]) -> dict:
     assembled = []
     for output in pipeline_outputs:
         result = assemble_result(
-            claim     = output.get("claim",     ""),
-            label     = output.get("label",     "NOT ENOUGH INFO"),
-            rationale = output.get("rationale", ""),
-            evidence  = output.get("evidence",  ""),
-            ner_query = output.get("ner_query", ""),
+            claim         = output.get("claim",      ""),
+            label         = output.get("label",      "NOT ENOUGH INFO"),
+            rationale     = output.get("rationale",  ""),
+            evidence      = output.get("evidence",   ""),
+            ner_query     = output.get("ner_query",  ""),
+            retrieved_url = output.get("source_url", ""),
+            timings       = output.get("timings",    {}),
         )
         assembled.append(result)
 

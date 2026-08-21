@@ -281,6 +281,49 @@
     .stat-dot.red    { background: var(--red); }
     .stat-dot.yellow { background: var(--yellow); }
 
+    /* ── Time bar (per-stage duration breakdown) ────────────────────────────── */
+    #time-bar-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    #time-bar {
+      display: flex;
+      height: 10px;
+      border-radius: 2px;
+      overflow: hidden;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-dim);
+    }
+
+    .time-seg {
+      height: 100%;
+      transition: width 0.4s ease;
+    }
+
+    #time-legend {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      font-size: 10px;
+      letter-spacing: 0.06em;
+      color: var(--text-dim);
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .legend-swatch {
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+
     /* ── Results table ──────────────────────────────────────────────────────── */
     #results-section {
       display: none;
@@ -502,6 +545,11 @@
           </div>
         </div>
       </div>
+      <!-- Time bar: stacked per-stage durations from response.timings -->
+      <div id="time-bar-wrap">
+        <div id="time-bar"></div>
+        <div id="time-legend"></div>
+      </div>
     </div>
 
     <!-- Results section -->
@@ -538,6 +586,8 @@
     const statSupports   = document.getElementById("stat-supports");
     const statRefutes    = document.getElementById("stat-refutes");
     const statNei        = document.getElementById("stat-nei");
+    const timeBar        = document.getElementById("time-bar");
+    const timeLegend     = document.getElementById("time-legend");
     const resultsList    = document.getElementById("results-list");
     const resultsSection = document.getElementById("results-section");
     const perfLabel      = document.getElementById("perf-label");
@@ -583,6 +633,44 @@
       show(errorBlock);
     }
 
+    // ── Time bar rendering ────────────────────────────────────────────────────
+    // Stage keys arrive in response.timings (seconds). "Other" is the wall
+    // time not attributed to a stage (NER, chunking, URL resolution, etc.).
+    const STAGE_META = [
+      ["extraction_s",   "Extraction",   "#5b8fff"],
+      ["retrieval_s",    "Retrieval",    "#f0c040"],
+      ["verification_s", "Verification", "#ff5b8f"],
+      ["other_s",        "Other",        "#3e3e50"],
+    ];
+
+    function renderTimeBar(t) {
+      timeBar.innerHTML    = "";
+      timeLegend.innerHTML = "";
+
+      const total = t.total_s || 0;
+      if (!total) return;
+
+      const known = (t.extraction_s || 0) + (t.retrieval_s || 0) + (t.verification_s || 0);
+      const vals  = { ...t, other_s: Math.max(0, total - known) };
+
+      for (const [key, label, color] of STAGE_META) {
+        const v = vals[key] || 0;
+        if (v < 0.05) continue;
+
+        const seg = document.createElement("div");
+        seg.className        = "time-seg";
+        seg.style.width      = `${(v / total) * 100}%`;
+        seg.style.background = color;
+        seg.title            = `${label}: ${v.toFixed(1)}s`;
+        timeBar.appendChild(seg);
+
+        const item = document.createElement("div");
+        item.className = "legend-item";
+        item.innerHTML = `<span class="legend-swatch" style="background:${color}"></span>${label} ${v.toFixed(1)}s`;
+        timeLegend.appendChild(item);
+      }
+    }
+
     // ── Label → color token ───────────────────────────────────────────────────
     // Mirror postprocessor.LABEL_COLORS so the badge class matches
     // the color token the backend sends in label_color.
@@ -595,6 +683,14 @@
     function renderFactRow(result, index) {
       const color  = colorClass(result.label_color);
       const rowId  = `evidence-${index}`;
+
+      // Per-claim timing line (from result.timings, seconds)
+      const tm = result.timings || {};
+      const fmtSec = v => (v == null ? "–" : `${Number(v).toFixed(1)}s`);
+      const hasTimings = tm.extraction_s != null || tm.retrieval_s != null || tm.verification_s != null;
+      const timingLine = hasTimings
+        ? `extraction ${fmtSec(tm.extraction_s)} · retrieval ${fmtSec(tm.retrieval_s)} · verification ${fmtSec(tm.verification_s)}`
+        : "";
 
       // Map label value to display text
       const labelText = {
@@ -618,6 +714,11 @@
               <span class="meta-key">Rationale</span>
               <span class="meta-value">${escapeHtml(result.rationale)}</span>
             </div>
+            ${timingLine ? `
+            <div class="meta-line">
+              <span class="meta-key">Timing</span>
+              <span class="meta-value">${timingLine}</span>
+            </div>` : ""}
             <div class="meta-line">
               <span class="meta-key">Source</span>
               <span class="meta-value">
@@ -679,13 +780,18 @@
 
       const t0 = performance.now();
 
+      // Declared outside try so the finally block can always clear it —
+      // otherwise a rejected fetch skips clearTimeout and the status bar
+      // reappears on top of the error message 3s later.
+      let timeoutId = null;
+
       try {
         // ── Fetch ──────────────────────────────────────────────────────────────
         // Update status text partway through to give the user a sense of
         // pipeline progress. The actual stages are sequential in the backend
         // and the total wait is typically 10-40s depending on GPU speed,
         // so a single intermediate message is enough to confirm the page isn't frozen.
-        const timeoutId = setTimeout(
+        timeoutId = setTimeout(
           () => setStatus("Retrieving Wikipedia evidence & verifying…"),
           3000
         );
@@ -695,8 +801,6 @@
           headers: { "Content-Type": "application/json" },
           body:    JSON.stringify({ text }),
         });
-
-        clearTimeout(timeoutId);
 
         if (!response.ok) {
           // Surface the FastAPI error detail to the developer
@@ -724,6 +828,7 @@
         statSupports.textContent   = `${s.SUPPORTS} supported`;
         statRefutes.textContent    = `${s.REFUTES} refuted`;
         statNei.textContent        = `${s["NOT ENOUGH INFO"]} uncertain`;
+        renderTimeBar(data.timings || {});
         show(summaryBar);
 
         // ── Render results ─────────────────────────────────────────────────────
@@ -740,6 +845,7 @@
       } catch (err) {
         showError(`Error: ${err.message}`);
       } finally {
+        clearTimeout(timeoutId);
         hide(statusBar);
         btnCheck.disabled = countWords(inputEl.value) === 0;
       }
