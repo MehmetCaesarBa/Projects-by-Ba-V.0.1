@@ -1,3 +1,4 @@
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -132,9 +133,16 @@ async def lifespan(app: FastAPI):
        Pings localhost:11434 to confirm Ollama is running. Prints a
        "run: ollama serve" hint if unreachable.
 
-    2. ollama_client.check_models()
-       Queries /api/tags to confirm both phi3:mini and qwen3:8b have been
-       pulled. Prints "run: ollama pull <model>" per missing model.
+    2. ollama_client.ensure_models_available()
+       Queries /api/tags and PULLS anything missing rather than only
+       reporting it. This replaced a check-and-warn call so that a fresh
+       clone works without the reader downloading a 2 GB GGUF by hand or
+       following the Colab notebook first — the first run fetches what is
+       absent, later runs find it cached.
+
+       Set AUTOCITATION_NO_AUTOPULL=1 to fall back to reporting only. CI
+       wants that: a test run should fail loudly on a missing model, not
+       quietly download several gigabytes.
 
     These checks surface the two most common local setup mistakes (Ollama
     not started, models not pulled) in the server log at startup rather
@@ -143,7 +151,9 @@ async def lifespan(app: FastAPI):
     print("\n[Main] AutoCitation pipeline starting up...")
 
     ollama_client.health_check()
-    ollama_client.check_models()
+    ollama_client.ensure_models_available(
+        auto_pull = os.getenv("AUTOCITATION_NO_AUTOPULL") != "1"
+    )
 
     print("[Main] Startup checks complete. Server ready.\n")
     yield

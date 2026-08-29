@@ -1,5 +1,8 @@
+import json
 import time
+
 import requests
+
 import config
 
 # ── Ollama REST API endpoints ─────────────────────────────────────────────────
@@ -36,6 +39,36 @@ MODEL_ROLES: dict[str, str] = {
     "fast"      : "phi3:mini",
     "reasoning" : "qwen3:8b",
 }
+
+# ── Registry sources for automatic pulling ────────────────────────────────────
+# Maps a LOCAL model name to the REGISTRY name it can be downloaded from.
+#
+# Most entries are identity mappings: "qwen3:8b" is published under that exact
+# name on ollama.com. The fine-tuned extractor is the exception — locally it is
+# registered as "autocitation-extractor" by `ollama create`, but nobody else has
+# run that command, so a fresh clone must fetch it from a namespace instead.
+#
+# Publishing it is a one-time step, and it distributes far more than the
+# weights: `ollama push` bundles the Modelfile's TEMPLATE, stop tokens and
+# parameters with the GGUF. That matters here specifically — finetune/Modelfile
+# documents that Ollama otherwise guesses the chat template from GGUF metadata
+# and picked "zephyr", wrapping every prompt in a format the fine-tune never
+# saw and producing generic, off-task replies. Shipping a bare .gguf leaves
+# every user one step away from reproducing that failure and concluding the
+# model is bad.
+#
+#     ollama signin
+#     ollama create <namespace>/autocitation-extractor -f Backend/finetune/Modelfile
+#     ollama push   <namespace>/autocitation-extractor
+#
+# Replace the namespace below with your own once published.
+MODEL_REGISTRY_SOURCES: dict[str, str] = {
+    "autocitation-extractor": "mehmetba/autocitation-extractor",
+}
+
+# Pulling an 8B model is a multi-gigabyte download; it must not inherit the
+# per-request inference timeout.
+PULL_TIMEOUT_SECONDS = 3600
 
 # ── Request config ────────────────────────────────────────────────────────────
 # REQUEST_TIMEOUT: Per-request HTTP timeout in seconds.
@@ -421,3 +454,103 @@ def check_models() -> dict[str, bool]:
             )
 
     return status
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 7 — Automatic model provisioning
+# ─────────────────────────────────────────────────────────────────────────────
+def pull_model(registry_name: str) -> bool:
+    """
+    Download a model into the local Ollama instance, streaming progress.
+
+    Returns True on success. Never raises: a failed pull is reported and the
+    server still starts, matching the fail-soft policy of the other startup
+    checks — a developer with a flaky connection should still be able to run
+    the API against whatever models they already have.
+
+    /api/pull streams newline-delimited JSON status objects. Consuming the
+    stream rather than blocking on stream=False matters for a multi-gigabyte
+    download: without progress output the process looks frozen for several
+    minutes and people kill it.
+    """
+    print(f"[OllamaClient] Pulling '{registry_name}' — this may take a while.")
+
+    try:
+        with requests.post(
+            f"{config.OLLAMA_BASE_URL}/api/pull",
+            json={"model": registry_name, "stream": True},
+            stream=True,
+            timeout=PULL_TIMEOUT_SECONDS,
+        ) as response:
+            response.raise_for_status()
+
+            last_percent = -1
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if event.get("error"):
+                    print(f"[OllamaClient] Pull failed: {event['error']}")
+                    return False
+
+                total, completed = event.get("total"), event.get("completed")
+                if total:
+                    percent = int(completed / total * 100)
+                    # Only print each 10% step — iter_lines yields hundreds of
+                    # events per second and would otherwise flood the log.
+                    if percent >= last_percent + 10:
+                        last_percent = percent
+                        print(f"[OllamaClient]   {percent:3d}%  {event.get('status', '')}")
+
+    except requests.exceptions.RequestException as e:
+        print(f"[OllamaClient] Pull of '{registry_name}' failed: {e}")
+        return False
+
+    print(f"[OllamaClient] '{registry_name}' is ready.")
+    return True
+
+
+def ensure_models_available(auto_pull: bool = True) -> dict[str, bool]:
+    """
+    Make every model the pipeline needs present locally, pulling what is missing.
+
+    This is what lets a fresh clone work without the reader following a notebook
+    or downloading a 2 GB file by hand: the first run fetches whatever is absent,
+    every run afterwards finds it cached and starts instantly.
+
+    NOTE ON WHICH MODELS ARE CHECKED: the names come from MODEL_ROLES, which is
+    the registry of what this client dispatches. claim_extractor.py and
+    verifier.py currently hardcode their own model names instead of routing
+    through here, so if you change one of those, change MODEL_ROLES too or the
+    provisioning will check for a model nothing uses.
+
+    auto_pull=False downgrades this to the reporting behaviour of
+    check_models() — useful in CI, where downloading gigabytes is not wanted.
+    """
+    status = check_models()
+    missing = [MODEL_ROLES[role] for role, ok in status.items() if not ok]
+
+    if not missing:
+        return status
+
+    if not auto_pull:
+        print(f"[OllamaClient] {len(missing)} model(s) missing; auto-pull disabled.")
+        return status
+
+    for local_name in missing:
+        # A locally-created model (from `ollama create`) is not downloadable
+        # under that name — it has to come from a published namespace.
+        registry_name = MODEL_REGISTRY_SOURCES.get(local_name, local_name)
+
+        if pull_model(registry_name) and registry_name != local_name:
+            print(
+                f"[OllamaClient] NOTE: pulled as '{registry_name}'. The pipeline "
+                f"asks for '{local_name}' — alias it once with:\n"
+                f"    ollama cp {registry_name} {local_name}"
+            )
+
+    return check_models()
