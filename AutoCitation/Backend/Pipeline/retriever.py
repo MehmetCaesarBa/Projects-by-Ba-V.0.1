@@ -61,7 +61,7 @@ OVERLAP_SENTENCES = 1
 # AFEV paper (Section 5.5, Figure 5a) found that 1-2 evidence pieces
 # per atomic fact yields optimal verification accuracy. We use 3 as a
 # ceiling to give the verifier slight selection headroom.
-TOP_K_CHUNKS = 3
+TOP_K_CHUNKS = 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────

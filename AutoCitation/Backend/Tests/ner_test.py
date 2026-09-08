@@ -253,3 +253,54 @@ def test_buried_subject_reaches_the_query():
 def test_query_set_is_deduplicated():
     queries = ner.extract_queries("Bosporus is located between Africa and Europe.")
     assert len(queries) == len(set(queries))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# check_negation — polarity
+# ═════════════════════════════════════════════════════════════════════════════
+def test_inserted_negation_is_rejected():
+    """
+    THE FABRICATION CASE, verbatim from a run.
+
+    The extractor turned a positive claim about the Amazon into a NEGATIVE claim
+    about the Nile. Every existing gate passed it — each content word appears in
+    the source, and 'not' is three characters so MIN_CONTENT_WORD_LENGTH filters
+    it out before the faithfulness comparison ever runs. The verifier then
+    refuted the fabrication and the pipeline reported a confident REFUTES on a
+    claim the input never made.
+    """
+    source = ("It is universally acknowledged as longer than the Nile by all "
+              "international cartographers.")
+    claim = "The Nile is not universally acknowledged as the world's longest river."
+    assert ner.check_negation(source, claim) is not None
+
+
+def test_dropped_negation_is_rejected():
+    """The other direction. Removing a 'not' reverses meaning just as thoroughly."""
+    source = "The colony was not abandoned in 1610."
+    claim = "The colony was abandoned in 1610."
+    assert ner.check_negation(source, claim) is not None
+
+
+def test_matching_polarity_passes():
+    """A faithful rewrite that preserves polarity must not be rejected."""
+    source = "The museum opened in 1932 and holds over 400 paintings."
+    claim = "The museum opened in 1932."
+    assert ner.check_negation(source, claim) is None
+
+
+def test_preserved_negation_passes():
+    """A negation carried through faithfully is fine — the gate is not anti-'not'."""
+    source = "The bridge was not completed until 1973."
+    claim = "The bridge was not completed until 1973."
+    assert ner.check_negation(source, claim) is None
+
+
+def test_negative_quantifier_counts_as_negation():
+    """
+    'no other' carries negation with no `neg` dependency arc anywhere, which is
+    why the lexicon exists alongside the dependency test. Neither check alone
+    covers the class.
+    """
+    assert ner._negation_count("No other river is longer.") >= 1
+    assert ner._negation_count("Every other river is shorter.") == 0

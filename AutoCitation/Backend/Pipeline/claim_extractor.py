@@ -256,6 +256,10 @@ def build_extraction_prompt(
         "decontextualization": "Replace the reference with the name it stands for, "
                                "taken from the document.",
         "fluency": "Write one complete, grammatical declarative sentence.",
+        "negation": "Keep the polarity of the source. If the text states something "
+                    "positively, state it positively; if it states something "
+                    "negatively, keep the negation. Never insert 'not', 'no' or "
+                    "'never', and never remove one.",
         "malformed": "Respond with exactly one line: 'Fact_N: <sentence>' or 'Terminate'.",
     }
 
@@ -630,6 +634,34 @@ def _extract_from_sentence(
                 f"document: {sorted(foreign)} | '{fact}'"
             )
             rejected_attempts.append((fact, "faithfulness", ", ".join(sorted(foreign))))
+            continue
+
+        # POLARITY GATE. Runs immediately after containment because it checks
+        # the half of faithfulness that containment structurally cannot see:
+        # _content_words drops every token shorter than
+        # MIN_CONTENT_WORD_LENGTH (4), and 'not' is three characters.
+        #
+        # Observed failure on this very input:
+        #
+        #   sentence: "It is universally acknowledged as longer than the Nile
+        #              by all international cartographers."      ('It' = Amazon)
+        #   claim:    "The Nile is not universally acknowledged as the world's
+        #              longest river."
+        #
+        # Wrong subject, inserted negation, meaning reversed — and every gate
+        # passed it, because each surviving content word does appear in the
+        # document and the 'not' was filtered out before comparison. The
+        # verifier then REFUTED the fabrication, and the run reported a
+        # confident REFUTES on a claim the input never made. The system did not
+        # merely fail to catch an error; it manufactured one.
+        #
+        # Compared against the SENTENCE, not the document. A negation elsewhere
+        # in the text licenses nothing here — that licence is exactly what the
+        # failure above took.
+        flipped = ner.check_negation(sentence, fact)
+        if flipped:
+            print(f"[Extractor]   Rejected polarity change — {flipped} | '{fact}'")
+            rejected_attempts.append((fact, "negation", flipped))
             continue
 
         # Check-worthiness gate. Unlike the two above this does NOT retry:

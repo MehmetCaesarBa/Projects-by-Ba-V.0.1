@@ -257,6 +257,104 @@ _ANAPHORIC = {
 _GENERIC_PRONOUNS = {"you", "your", "one", "we", "our", "us", "i", "my"}
 
 
+# ── Polarity ──────────────────────────────────────────────────────────────────
+# Negation markers, matched by surface form and by the 'neg' dependency.
+#
+# BOTH tests are needed and neither is redundant. The dependency label catches
+# 'not'/'n't' attached to a verb, which is the common case, but spaCy does not
+# label negative quantifiers and determiners that way — "no other river",
+# "neither claim", "without evidence" carry negation with no neg arc anywhere.
+# The lexicon catches those. Conversely the lexicon alone would miss a 'neg'
+# arc on a token spelled unusually.
+#
+# CLOSED CLASS. Negation in English is a finite list, so an explicit set here is
+# the complete answer rather than a heuristic standing in for a model.
+_NEGATION_MARKERS = {
+    "not", "n't", "no", "never", "none", "neither", "nor", "nothing",
+    "nobody", "nowhere", "without", "cannot", "nope",
+}
+
+
+def _negation_count(text: str) -> int:
+    """How many negation markers `text` carries."""
+    doc = NLP(text)
+    seen: set[int] = set()
+    for token in doc:
+        if token.dep_ == "neg" or token.text.lower() in _NEGATION_MARKERS:
+            seen.add(token.i)
+    return len(seen)
+
+
+def check_negation(source: str, claim: str) -> str | None:
+    """
+    Does the claim carry the same polarity as the text it came from?
+
+    Returns None when polarity matches, otherwise a plain-language defect string
+    the extractor feeds back into its retry prompt.
+
+    THE HOLE THIS CLOSES. The faithfulness gate is containment over content
+    words, and it filters tokens shorter than MIN_CONTENT_WORD_LENGTH (4) before
+    comparing. 'not' is three characters. So the single most meaning-changing
+    word in English is invisible to the check that exists to catch meaning
+    changes, and a claim can be reversed while passing every gate.
+
+    Not hypothetical. An observed run turned
+
+        source:  "It is universally acknowledged as longer than the Nile by all
+                  international cartographers."          ('It' = the Amazon)
+        claim:   "The Nile is not universally acknowledged as the world's
+                  longest river."
+
+    — wrong subject, inserted negation, meaning reversed — and every gate passed
+    it, because each surviving content word does appear in the document and the
+    inserted 'not' was filtered out before comparison. The verifier then refuted
+    the fabrication and the run reported a confident REFUTES on a claim the
+    input never made. That is worse than any missed verdict: the system did not
+    fail to catch an error, it INVENTED one.
+
+    WHY NOT JUST LOWER MIN_CONTENT_WORD_LENGTH. Because it would admit 'the',
+    'and', 'of', 'in' into the faithfulness vocabulary and flood the gate with
+    function words, and because negation is not a vocabulary question anyway —
+    "no other river is longer" and "every other river is shorter" use different
+    words to say the same thing, while "is" and "is not" differ by one token and
+    say opposite things. Polarity needs its own check, which is what this is.
+
+    SCOPED TO THE SOURCE CLAUSE, NOT THE DOCUMENT. A document containing a
+    negation anywhere would otherwise license one anywhere, which is precisely
+    the licence the failure above took.
+
+    COUNTS, NOT PRESENCE. "did not fail" and "failed" differ by two markers and
+    mean the same thing; comparing booleans would call them identical. Comparing
+    counts also flags a dropped negation, which reverses meaning just as
+    thoroughly as an added one.
+
+    FALSE REJECTIONS ARE ACCEPTABLE HERE. A faithful rewrite can legitimately
+    change polarity — "greater than any other" into "no other is greater" — and
+    this will reject it. That costs one extraction call (~10s) and a retry. A
+    false acceptance costs a fabricated verdict, which is the failure this whole
+    project exists to prevent. The asymmetry decides the design, as it did for
+    the containment gate.
+    """
+    source_negations = _negation_count(source)
+    claim_negations = _negation_count(claim)
+
+    if claim_negations == source_negations:
+        return None
+
+    if claim_negations > source_negations:
+        return (
+            "it negates something the source text does not — the source carries "
+            f"{source_negations} negation(s) and this claim carries "
+            f"{claim_negations}. State what the text says, not its opposite"
+        )
+
+    return (
+        "it drops a negation the source text carries — the source has "
+        f"{source_negations} negation(s) and this claim has {claim_negations}. "
+        "Removing a 'not' reverses the meaning"
+    )
+
+
 def check_decontextualized(claim: str) -> str | None:
     """
     Is the claim intelligible standing alone? (AIDA's 'Independent', via
