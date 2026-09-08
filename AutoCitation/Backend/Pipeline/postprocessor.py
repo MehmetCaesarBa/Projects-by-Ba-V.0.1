@@ -32,12 +32,26 @@ LABEL_COLORS = {
     "NOT ENOUGH INFO" : "yellow",
 }
 
-# FALLBACK_URL: Returned as source_url when Wikipedia URL resolution fails
-# entirely (network error, no results, disambiguation dead-end).
-# An empty string would silently render as a broken link in the frontend;
-# a None would require null-checks everywhere. A fallback search URL gives
-# the user a recoverable path to investigate the claim themselves.
-FALLBACK_URL = "https://en.wikipedia.org/wiki/Special:Search"
+# NO SOURCE. Returned when Wikipedia URL resolution fails entirely (network
+# error, no results, disambiguation dead-end) or when there was never anything
+# to resolve.
+#
+# This used to be "https://en.wikipedia.org/wiki/Special:Search" — a bare search
+# page — on the reasoning that an empty string renders as a broken link and None
+# would require null-checks everywhere. Both true, and both beside the point:
+# THE FALLBACK WAS A CITATION THAT CITED NOTHING. Every verdict in this system
+# carries a source, so a row showing a link implies evidence was found at it.
+# Special:Search is a link to the act of searching.
+#
+# It went from cosmetic to actively misleading when EXTRACTION_FAILURE records
+# arrived. Those have no query and no evidence by construction — the sentence
+# never became a claim — and the pipeline dutifully searched for '' and printed
+# a Wikipedia URL beside the words "never verified". A reader scanning the
+# results sees a citation next to a claim nothing was ever checked against.
+#
+# An empty string is the honest value, and the frontend can decide how to render
+# the absence of a source. That is a rendering question, not a data question.
+NO_SOURCE_URL = ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,7 +78,7 @@ def resolve_wikipedia_url(query: str) -> str:
     "Mehmed II (disambiguation)") as the top result when multiple articles
     share a name. We detect this by checking for "(disambiguation)" in the
     title and fall through to the next candidate if found. If all candidates
-    are disambiguation pages or the list is exhausted, FALLBACK_URL is
+    are disambiguation pages or the list is exhausted, NO_SOURCE_URL is
     returned.
 
     Network resilience:
@@ -80,14 +94,14 @@ def resolve_wikipedia_url(query: str) -> str:
 
     Returns:
         Canonical Wikipedia article URL string (https://en.wikipedia.org/wiki/...)
-        or FALLBACK_URL if resolution fails.
+        or NO_SOURCE_URL ("") if resolution fails.
 
     Example:
         resolve_wikipedia_url("Mehmed II Constantinople")
         → "https://en.wikipedia.org/wiki/Mehmed_II"
 
         resolve_wikipedia_url("nonexistent topic xyz 99999")
-        → "https://en.wikipedia.org/wiki/Special:Search"
+        → ""   (no source; the caller renders the absence)
     """
     print(f"[Postprocessor] Resolving Wikipedia URL for query: '{query}'")
 
@@ -130,12 +144,12 @@ def resolve_wikipedia_url(query: str) -> str:
             return url
 
         # All candidates were disambiguation pages or list was empty
-        print("[Postprocessor] No valid article found — using fallback URL.")
-        return FALLBACK_URL
+        print("[Postprocessor] No valid article found — no source URL for this claim.")
+        return NO_SOURCE_URL
 
     except Exception as e:
         print(f"[Postprocessor] Wikipedia URL resolution failed: {e}")
-        return FALLBACK_URL
+        return NO_SOURCE_URL
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -237,7 +251,7 @@ def assemble_result(
             "label_color": "green" | "red" | "yellow",
             "rationale"  : str,
             "evidence"   : str   (truncated to 300 chars if needed),
-            "source_url" : str   (canonical Wikipedia URL or fallback)
+            "source_url" : str   (canonical Wikipedia URL, or "" when none)
         }
 
     Example:
@@ -264,7 +278,17 @@ def assemble_result(
     # (attached by retriever.fetch). Only fall back to search-based
     # resolution when retrieval produced no URL — this keeps the citation
     # and the evidence pointing at the same article.
-    source_url = retrieved_url if retrieved_url else resolve_wikipedia_url(ner_query)
+    # An empty ner_query means there was never a lookup to resolve — an
+    # EXTRACTION_FAILURE or UNVERIFIABLE record, where no claim reached
+    # retrieval. Calling out to Wikipedia with '' costs a network round trip to
+    # be told nothing, and its only possible product is a citation for a claim
+    # that was never checked.
+    if retrieved_url:
+        source_url = retrieved_url
+    elif ner_query.strip():
+        source_url = resolve_wikipedia_url(ner_query)
+    else:
+        source_url = NO_SOURCE_URL
 
     # Truncate evidence for frontend display clarity.
     # Full chunk text is preserved for the label decision but truncated

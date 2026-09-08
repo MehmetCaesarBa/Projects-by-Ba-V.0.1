@@ -5,6 +5,57 @@ import requests
 
 import config
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inference instrumentation
+# ─────────────────────────────────────────────────────────────────────────────
+_NS = 1e9
+
+
+def log_inference_stats(body: dict, tag: str = "") -> None:
+    """
+    Print Ollama's own per-call counters.
+
+    Wall-clock timing around requests.post() gives one number and no diagnosis.
+    Ollama returns the breakdown for free in every response, and it answers
+    three questions that wall-clock cannot:
+
+      tok/s on OUTPUT   ~2-4 means CPU inference; 30-60 means GPU. This is the
+                        single most important number in the project, because
+                        ~85% of runtime is token generation.
+
+      output token COUNT
+                        A three-line answer is ~60 tokens. Anything far above
+                        that is qwen3's <think> block, which verifier.py strips
+                        and discards after paying to generate it.
+
+      load_duration     Non-zero on most calls means the model is being
+                        RELOADED. The pipeline alternates phi3 (extract) and
+                        qwen3 (verify), so if only one fits in memory Ollama
+                        evicts and reloads on every alternation — a multi-second
+                        tax per call that no amount of prompt tuning can touch.
+                        Fixes are OLLAMA_MAX_LOADED_MODELS and keep_alive, not
+                        code.
+
+    Never raises: an older Ollama that omits these fields must not break a
+    request that otherwise succeeded.
+    """
+    try:
+        load_s = body.get("load_duration", 0) / _NS
+        p_tok = body.get("prompt_eval_count", 0)
+        p_s = body.get("prompt_eval_duration", 0) / _NS
+        o_tok = body.get("eval_count", 0)
+        o_s = body.get("eval_duration", 0) / _NS
+
+        p_rate = f"{p_tok / p_s:.0f} tok/s" if p_s else "n/a"
+        o_rate = f"{o_tok / o_s:.1f} tok/s" if o_s else "n/a"
+
+        print(f"[Inference] {tag:<12} load {load_s:5.1f}s | "
+              f"prompt {p_tok:>5} tok in {p_s:6.1f}s ({p_rate}) | "
+              f"output {o_tok:>5} tok in {o_s:6.1f}s ({o_rate})")
+    except Exception:
+        pass
+
 # ── Ollama REST API endpoints ─────────────────────────────────────────────────
 # GENERATE_URL: The primary completions endpoint. Both pipeline models
 # (phi3:mini and qwen3:8b) are called through this single endpoint —

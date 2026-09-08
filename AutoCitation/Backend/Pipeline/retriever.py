@@ -1,5 +1,7 @@
+import math
 import re
 import time
+from collections import Counter
 
 import requests
 import wikipedia
@@ -61,7 +63,7 @@ OVERLAP_SENTENCES = 1
 # AFEV paper (Section 5.5, Figure 5a) found that 1-2 evidence pieces
 # per atomic fact yields optimal verification accuracy. We use 3 as a
 # ceiling to give the verifier slight selection headroom.
-TOP_K_CHUNKS = 3
+TOP_K_CHUNKS = 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,14 +196,61 @@ def chunk_articles(articles: list[tuple[str, str]]) -> list[tuple[str, str]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 — Semantic Chunk Scoring
+# STEP 3 — Lexical Chunk Scoring
 # ─────────────────────────────────────────────────────────────────────────────
+# Named "Semantic" until it was noticed that nothing here computes meaning.
+# This is term matching weighted by rarity — a chunk saying "particle
+# accelerator" scores zero against a claim saying "particle collider", because
+# the strings differ. Calling it semantic invites a reader to assume embedding
+# machinery exists somewhere in the project. It does not.
+# ── Ranking parameters ────────────────────────────────────────────────────────
+# MIN_SCORE_TOKEN_LENGTH: tokens this short are articles and prepositions that
+# add noise without meaning. Previously the inline `len(t) > 2`.
+MIN_SCORE_TOKEN_LENGTH = 3
+
+# USE_IDF_WEIGHTING: weight each matched token by how RARE it is across the
+# chunks retrieved for this claim, instead of counting every token equally.
+#
+# The unweighted version treated 'bosporus' and 'europe' as worth the same,
+# which is how a passage about African rainfall scored 0.42 against a claim
+# about a strait — it matched 'africa', 'europe' and 'between' while missing
+# the only word that identified the subject. Rare terms are what distinguish
+# a relevant passage; common ones are satisfied by almost anything.
+#
+# The document frequencies come from the ~60-90 chunks just retrieved, not a
+# global corpus. That is deliberate: it needs no index, no download and no
+# dependency, and it is arguably better suited to the task — a term appearing
+# in every chunk fetched for THIS claim is uninformative for choosing between
+# them, whatever its frequency in English at large.
+USE_IDF_WEIGHTING = True
+
+
+def _tokenize(text: str) -> set[str]:
+    """Lowercase content tokens used by the ranker."""
+    return {
+        t for t in re.findall(r'\b[a-zA-Z0-9]+\b', text.lower())
+        if len(t) >= MIN_SCORE_TOKEN_LENGTH
+    }
+
+
 def score_chunks(fact: str, chunks: list[tuple[str, str]]) -> list[tuple[float, str, str]]:
     """
-    Scores each chunk against the atomic fact using token-level overlap.
+    Scores each chunk against the atomic fact by IDF-weighted term coverage.
 
-    Scoring formula (Jaccard-inspired coverage of the claim):
-        score = |fact_tokens ∩ chunk_tokens| / |fact_tokens|
+    Scoring formula:
+        score = Σ idf(t) for t in (fact ∩ chunk)  /  Σ idf(t) for t in fact
+
+    where idf(t) = log(N / df(t)), N = number of chunks retrieved for this
+    claim and df(t) = how many of them contain t.
+
+    The denominator keeps the score in [0, 1] and preserves its meaning as
+    "how much of the claim this chunk covers", so the printed Top chunk score
+    stays comparable to earlier runs in magnitude — but a chunk now has to
+    cover the claim's DISTINCTIVE words to score highly, not merely three
+    common ones.
+
+    Setting USE_IDF_WEIGHTING = False restores plain term coverage, which is
+    the point of comparison when measuring whether this helped.
 
     Args:
         fact   : atomic claim string from claim_extractor
@@ -215,13 +264,7 @@ def score_chunks(fact: str, chunks: list[tuple[str, str]]) -> list[tuple[float, 
         print("[Retriever] No chunks available to score.")
         return []
 
-    # Normalize fact to lowercase token set for case-insensitive matching.
-    # Short tokens (≤2 chars) are excluded as they are typically articles
-    # or prepositions that add noise without semantic value.
-    fact_tokens = {
-        t for t in re.findall(r'\b[a-zA-Z0-9]+\b', fact.lower())
-        if len(t) > 2
-    }
+    fact_tokens = _tokenize(fact)
 
     if not fact_tokens:
         # If the fact contains no meaningful tokens after filtering,
@@ -229,22 +272,33 @@ def score_chunks(fact: str, chunks: list[tuple[str, str]]) -> list[tuple[float, 
         print("[Retriever] No scoreable tokens found in fact. Returning unscored chunks.")
         return [(0.0, chunk, url) for chunk, url in chunks]
 
+    chunk_token_sets = [_tokenize(chunk) for chunk, _ in chunks]
+
+    if USE_IDF_WEIGHTING:
+        total = len(chunk_token_sets)
+        df = Counter(t for tokens in chunk_token_sets for t in tokens)
+        # +1 inside the log keeps the weight strictly positive: a term present
+        # in every retrieved chunk would otherwise score log(1) = 0 and drop
+        # out of the denominator entirely, which can make it zero.
+        weight = {t: math.log(1 + total / (1 + df.get(t, 0))) for t in fact_tokens}
+    else:
+        weight = {t: 1.0 for t in fact_tokens}
+
+    denominator = sum(weight[t] for t in fact_tokens) or 1.0
+
     scored = []
-    for chunk, url in chunks:
-        chunk_tokens = {
-            t for t in re.findall(r'\b[a-zA-Z0-9]+\b', chunk.lower())
-            if len(t) > 2
-        }
-        # Intersection over fact length: measures how much of the claim
-        # is covered by the chunk, not how large the chunk is.
-        overlap = len(fact_tokens & chunk_tokens)
-        score   = overlap / len(fact_tokens)
+    for (chunk, url), chunk_tokens in zip(chunks, chunk_token_sets, strict=True):
+        matched = fact_tokens & chunk_tokens
+        score = sum(weight[t] for t in matched) / denominator
         scored.append((score, chunk, url))
 
     # Sort descending: highest relevance chunks surface to the top
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    print(f"[Retriever] Top chunk score: {scored[0][0]:.2f}" if scored else "")
+    if scored:
+        mode = "IDF-weighted" if USE_IDF_WEIGHTING else "term-coverage"
+        print(f"[Retriever] Top chunk score: {scored[0][0]:.2f} ({mode})")
+
     return scored
 
 
@@ -256,12 +310,47 @@ def select_top_chunks(scored_chunks: list[tuple[float, str, str]]) -> tuple[list
     Selects the top-k highest scoring chunks for delivery to verifier.py,
     plus the URL of the best-scoring chunk's article — used as the citation.
 
-    Why cap at TOP_K_CHUNKS (3)?
-    AFEV paper Section 5.5 Figure 5(a) demonstrates that verification
-    accuracy peaks at k=1-2 evidence pieces per atomic fact. Beyond k=3,
-    noise from lower-relevance chunks begins to degrade reasoning model
-    performance. We use k=3 as a slight buffer to account for cases where
-    the top chunk is partially relevant but not sufficient alone.
+    Why cap at TOP_K_CHUNKS?
+    AFEV paper Section 5.5 Figure 5(a) demonstrates that verification accuracy
+    peaks at k=1-2 evidence pieces per atomic fact; beyond k=3, noise from
+    lower-relevance chunks degrades reasoning model performance.
+
+    THE VALUE IS 2 AND THIS DOCSTRING SAID 3 for some time, which is how a
+    change made during the speed work went unrecorded and later became a
+    suspect in a regression it had nothing to do with. Read the constant, not
+    the prose — and update the prose when the constant moves.
+
+    WHAT THIS FUNCTION LOGS, AND WHY IT MATTERS MORE THAN IT LOOKS.
+    Only the model's chosen Evidence_N used to reach the log, so a question as
+    basic as "did the two selected chunks come from the same article?" was
+    unanswerable after the fact. It stopped being academic on an observed run:
+
+        fact 1  "...was founded in May 1607"
+        fact 2  "...is celebrated as the earliest EUROPEAN permanent settlement"
+
+    Two different claims, 85 candidate chunks across 6 articles, and both were
+    answered with a passage stating "the first permanent ENGLISH settlement...
+    founded May 14, 1607". Different articles, same proposition. Fact 2 asked
+    about European settlement chronology and was handed the Jamestown founding
+    narrative twice over.
+
+    That is a predictable consequence of the ranking formula rather than bad
+    luck. The claim's highest-IDF token is its SUBJECT NAME — 'Jamestown' is by
+    far the rarest word in it — so any chunk containing that name captures most
+    of the numerator immediately. But evidence that would REFUTE "Jamestown was
+    first" is a passage about St. Augustine, and a passage about St. Augustine
+    cannot contain the word 'Jamestown'. The most discriminating term in the
+    query is precisely the term counter-evidence is structurally unable to hold.
+
+    So the top-k is drawn from a pool that is biased toward confirmation before
+    any cutoff is applied, and raising k buys redundancy rather than coverage:
+    chunk 3 is a third passage about the same subject. That is why tuning
+    TOP_K_CHUNKS never moved the verdicts.
+
+    Printing every selection with its score and article makes the redundancy
+    visible per run instead of inferable from a rationale. This function still
+    only ranks and slices — the diversity question it now exposes is deliberately
+    NOT answered here.
 
     Args:
         scored_chunks : list of (score, chunk, article_url) tuples sorted descending
@@ -274,10 +363,29 @@ def select_top_chunks(scored_chunks: list[tuple[float, str, str]]) -> tuple[list
         print("[Retriever] No scored chunks to select from.")
         return [], ""
 
-    top      = [chunk for _, chunk, _ in scored_chunks[:TOP_K_CHUNKS]]
-    best_url = scored_chunks[0][2]
+    selected = scored_chunks[:TOP_K_CHUNKS]
+    top      = [chunk for _, chunk, _ in selected]
+    best_url = selected[0][2]
 
-    print(f"[Retriever] Selected {len(top)} chunk(s) for verifier.")
+    print(f"[Retriever] Selected {len(top)} chunk(s) for verifier:")
+    for i, (score, chunk, url) in enumerate(selected, 1):
+        # Article title rather than the full URL: it is the part that answers
+        # "are these the same source?", and it keeps the line readable.
+        title = url.rsplit("/", 1)[-1] if url else "(no url)"
+        preview = re.sub(r"\s+", " ", chunk).strip()[:110]
+        print(f"[Retriever]   Evidence_{i}  score {score:.2f}  [{title}]  {preview}...")
+
+    # Distinct article count for the selection, not for the candidate pool. Two
+    # chunks from one article is not automatically wrong — a single article can
+    # hold two genuinely different passages — but it is the case where the
+    # verifier is most likely to be reading the same claim twice.
+    distinct = len({url for _, _, url in selected if url})
+    if len(selected) > 1 and distinct == 1:
+        print(
+            f"[Retriever]   NOTE: all {len(selected)} selected chunks come from one "
+            f"article. The verifier is seeing a single source's account of this claim."
+        )
+
     return top, best_url
 
 

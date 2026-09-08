@@ -5,3 +5,10 @@ langchain-community
 wikipedia
 spacy
 pydantic
+
+# Snowball stemmer (claim_extractor) + Opinion Lexicon (ner).
+# Both degrade gracefully if absent: the stemmer falls back to a four-suffix
+# stripper and the subjectivity gate to a 36-word built-in list. The lexicon
+# corpus is a separate one-off download:
+#     python -c "import nltk; nltk.download('opinion_lexicon')"
+nltk

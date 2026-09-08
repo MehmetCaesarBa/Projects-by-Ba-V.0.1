@@ -156,6 +156,241 @@ def split_sentences(text: str) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# STEP 0b2 — Clause Enumeration
+# ─────────────────────────────────────────────────────────────────────────────
+# Relations that introduce a SEPARATE proposition worth checking on its own.
+#
+#   conj    coordination — "X was founded in 1607 AND is celebrated as ..."
+#   relcl   relative clause — "the Amazon, WHICH discharges more water than ..."
+#   advcl   adverbial clause — "BECAUSE it rose so high, it surpassed ..."
+#
+# ccomp is deliberately EXCLUDED. In "Stalin confessed that he intended to
+# install elections", the ccomp is "he intended to install elections" — but the
+# claim being made is that Stalin SAID it, not that it is true. Extracting the
+# complement as a standalone fact would check the wrong proposition.
+_CLAUSE_DEPS = ("conj", "relcl", "advcl")
+
+# Below this many tokens a clause is a fragment, not a proposition.
+MIN_CLAUSE_TOKENS = 3
+
+# Words that stand in for a noun inside a relative clause. Matched by surface
+# form as well as by tag, because a mis-tagged relativiser left in place yields
+# a claim like "which discharges more water" — grammatical, and unanchorable
+# for retrieval since it names nothing.
+_RELATIVISERS = {"which", "who", "whom", "whose", "that"}
+
+
+def _clause_head_tokens(doc) -> list:
+    """
+    Every token that heads its own proposition, in sentence order.
+
+    Starts at the ROOT and follows _CLAUSE_DEPS transitively, so a chain like
+    "A happened, B happened and C happened" yields three heads rather than two.
+    Only verbs and auxiliaries qualify — a coordinated NOUN ("Peter and Paul
+    travelled") is one proposition with a compound subject, not two.
+    """
+    root = next((t for t in doc if t.head == t), None)
+    if root is None:
+        return []
+
+    # Scanned across the whole doc rather than descended from the ROOT, because
+    # a relative clause attaches to a NOUN, not to a verb: in "the Amazon,
+    # which discharges more water", `discharges` is a relcl child of `Amazon`.
+    # Walking only verb-to-verb never reaches it, and the proposition is lost.
+    heads = [root] + [
+        t for t in doc
+        if t.i != root.i and t.dep_ in _CLAUSE_DEPS and t.pos_ in ("VERB", "AUX")
+    ]
+    return sorted(heads, key=lambda t: t.i)
+
+
+def _inherited_subject(head):
+    """
+    The subject a clause borrows when it has none of its own.
+
+    English elides the subject under coordination: in "X was founded in 1607
+    and is celebrated as ...", the second clause has no nsubj at all. Without
+    restoring it the clause reads "is celebrated as the earliest ...", which is
+    not a checkable claim — it has no subject to check.
+
+    For a relative clause the antecedent is the noun the clause modifies:
+    "the Amazon, which discharges ..." -> subject is "the Amazon".
+
+    "HAS ITS OWN SUBJECT" MEANS THE HEAD'S OWN CHILD, NOT ANY TOKEN IN THE SPAN.
+    This test used to scan every token in the clause's index set:
+
+        any(t.dep_ in ("nsubj", ...) for t in head.doc if t.i in own_indices)
+
+    which counts subjects belonging to NESTED clauses. Observed on the project's
+    own test input:
+
+        "...was founded in May 1607 and is celebrated as the earliest European
+         permanent settlement in what is now the United States."
+
+    The second clause contains "in WHAT IS now the United States", and 'what' is
+    the nsubj of 'is'. The scan found it, concluded 'celebrated' already had a
+    subject, and inherited nothing. The clause came out as
+
+        'is celebrated as the earliest European permanent settlement in what is
+         now the United States'
+
+    with no subject at all — and the model then invented one, producing a claim
+    about a bare "Jamestown" instead of "The English settlement of Jamestown".
+    That changed the recovered subject, which changed the query set, which
+    changed the article pool, which is where the passage that refutes the claim
+    stopped being retrieved. A parse-level false negative propagated all the way
+    to the verdict.
+
+    Subjecthood is a relation between a token and ITS head, so the question is
+    only ever about head.children. Scanning the span asks a different question
+    and gets a different answer whenever the clause embeds another clause.
+
+    WHY NO TEST CAUGHT IT: every clause case in the suite coordinates two SIMPLE
+    clauses ("The museum opened in 1932 and holds over 400 paintings"). None
+    embeds a subordinate clause inside the second conjunct, which is the only
+    shape that triggers the bug.
+    """
+    if any(c.dep_ in ("nsubj", "nsubjpass", "expl") for c in head.children):
+        return None                                  # it has its own
+
+    if head.dep_ == "relcl":
+        return head.head                             # the modified noun
+
+    # Walk up the clause chain looking for a subject to share.
+    cur = head
+    while cur.head.i != cur.i:
+        cur = cur.head
+        for child in cur.children:
+            if child.dep_ in ("nsubj", "nsubjpass"):
+                return child
+    return None
+
+
+def _render_clause(doc, indices: set[int]) -> str:
+    """
+    Turn a set of token indices back into readable text.
+
+    Joining tokens with spaces reintroduces the spacing the tokenizer removed:
+    "founded in May 1607 ." and "Jamestown 's founding". The clause is fed
+    straight to an LLM and to the faithfulness gate, so it has to read as a
+    sentence rather than as a token dump.
+
+    STRANDED SEPARATORS. The caller drops punctuation only when it precedes the
+    clause head (`t.is_punct and t.i < head.i`), so a comma that came AFTER the
+    head survives into the clause even though the material it separated does
+    not. Observed:
+
+        'The title of the world's longest river belongs to the Amazon River,.'
+
+    The comma introduced the relative clause, which now belongs to a different
+    clause entirely; what remains is a separator with nothing left to separate.
+    The trailing `.strip(" ,;")` below cannot reach it, because the sentence-final
+    full stop is the last character and shields it from the strip.
+
+    Cleaned here rather than in the caller because it is a rendering concern:
+    the token SET is right, only its punctuation reads wrong. It matters beyond
+    tidiness — the clause string is what check_fluency parses and what the model
+    is asked to rewrite, and ',.' is not a sequence en_core_web_sm sees in
+    training data.
+    """
+    text = " ".join(doc[i].text for i in sorted(indices))
+    text = re.sub(r"\s+([.,;:!?)\]])", r"\1", text)   # no space before closers
+    text = re.sub(r"([(\[])\s+", r"\1", text)         # no space after openers
+    text = re.sub(r"\s+('s|n't|'re|'ve|'ll|'d)\b", r"\1", text)
+    text = re.sub(r"\s{2,}", " ", text)
+
+    # A separator immediately followed by another separator, or sitting at the
+    # very end, has nothing left on one side of it. Runs first so that ',.'
+    # becomes '.' before the trailing strip runs.
+    text = re.sub(r"[,;:]+(?=\s*[,;:.!?])", "", text)
+    text = re.sub(r"[,;:]+\s*$", "", text)
+
+    return text.strip(" ,;")
+
+
+def enumerate_clauses(sentence: str) -> list[str]:
+    """
+    Split a sentence into its clause-level propositions, one per predicate.
+
+    WHY THIS EXISTS: the extractor used to be asked "read this sentence, diff it
+    against the facts you already produced, and give me the next uncovered
+    relation." That is set-difference over semantics, and phi3:mini cannot do
+    it — given a two-clause sentence it produced the first relation and then
+    returned it verbatim three times in a row, so the second relation (which
+    happened to be the FALSE one) was never extracted or checked.
+
+    Syntax answers the same question mechanically. The clauses are marked in the
+    parse; no search is required. The model's job shrinks from "find what is
+    missing" to "tidy this clause into a sentence", which it is good at.
+
+    Returns the clause strings in sentence order, each with a subject restored
+    if it borrowed one. Returns [sentence] unchanged when enumeration finds
+    nothing better — a single-clause sentence is already one proposition, and a
+    parse failure should degrade to current behaviour rather than lose the
+    sentence.
+    """
+    doc = NLP(sentence)
+    heads = _clause_head_tokens(doc)
+
+    if len(heads) < 2:
+        return [sentence.strip()]
+
+    head_indices = {h.i for h in heads}
+    clauses: list[tuple[int, str]] = []
+
+    for head in heads:
+        # A clause owns its subtree MINUS the subtrees of the other clause
+        # heads, so coordinated material is not duplicated across clauses.
+        own = {t.i for t in head.subtree}
+        for other in heads:
+            if other.i != head.i and other.i in own:
+                own -= {t.i for t in other.subtree}
+
+        if head.dep_ == "relcl":
+            # "the Amazon, WHICH discharges more water" -> the proposition is
+            # "the Amazon discharges more water". Swap the relativiser for the
+            # noun it stands in for; leaving 'which' produces a claim with no
+            # identifiable subject, which retrieval cannot anchor on.
+            own -= {
+                t.i for t in doc
+                if t.i in own and (
+                    t.tag_ in ("WDT", "WP", "WP$")
+                    or (t.pos_ == "PRON" and t.text.lower() in _RELATIVISERS)
+                )
+            }
+            own |= ({t.i for t in head.head.subtree}
+                    - {t.i for t in head.subtree})
+        else:
+            subject = _inherited_subject(head)
+            if subject is not None:
+                own |= {t.i for t in subject.subtree}
+
+        # Punctuation and conjunctions are stripped LAST, after the subject or
+        # antecedent has been merged in. Doing it earlier let the antecedent's
+        # subtree reintroduce the comma that separated the relative clause:
+        # "The Amazon River, discharges more water".
+        own -= {
+            t.i for t in doc
+            if t.i in own and (t.dep_ == "cc" or (t.is_punct and t.i < head.i))
+        }
+
+        text = _render_clause(doc, own)
+        if len(own) >= MIN_CLAUSE_TOKENS and text:
+            # Ordered by the HEAD's position, not by the lowest token index.
+            # Once a subject is inherited, every clause starts at index 0, so
+            # min(own) ties and the sort falls through to comparing the strings
+            # alphabetically — which put "is celebrated" before "was founded".
+            clauses.append((head.i, text))
+
+    if not clauses:
+        return [sentence.strip()]
+
+    ordered = [text for _, text in sorted(clauses)]
+    print(f"[NER] Sentence split into {len(ordered)} clause(s).")
+    return ordered
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 0c — Claim Quality Gates (Fluency + Check-worthiness)
 # ─────────────────────────────────────────────────────────────────────────────
 # Both gates run on a parse we already need, so they cost ~10ms and no model
@@ -164,13 +399,64 @@ def split_sentences(text: str) -> list[str]:
 # time it fires, whereas an LLM-based check-worthiness classifier at ~10s per
 # claim only breaks even if it rejects more than ~6.6% of claims.
 
-# Predicates that signal opinion rather than checkable fact.
-_SUBJECTIVE_LEMMAS = {
+# ── Subjectivity lexicon ──────────────────────────────────────────────────────
+# SENTIMENT IS NOT SUBJECTIVITY, and the gate needs both.
+#
+# Hu & Liu's Opinion Lexicon (~6,800 words, bundled with NLTK) covers evaluative
+# vocabulary: beautiful, terrible, stunning, awful. It does NOT cover epistemic
+# and deontic markers — 'seems', 'believes', 'should', 'ought' — which make a
+# sentence subjective while carrying no sentiment at all. "The bridge should be
+# repaired" contains no positive or negative word and is still an opinion.
+#
+# So the lexicon is the union of the two: an off-the-shelf sentiment list for
+# breadth, plus a hand-written set for the modal/epistemic class that sentiment
+# resources systematically miss.
+#
+# Falls back to the original hand-written set when NLTK or its corpus is
+# unavailable, so a fresh clone works before anyone runs nltk.download().
+
+# Epistemic and deontic markers. Closed class, and absent from every sentiment
+# lexicon — these are the words that make a claim an assertion about the
+# speaker's state rather than about the world.
+_EPISTEMIC_MARKERS = {
+    "seem", "feel", "believe", "think", "suppose", "guess", "reckon",
+    "deserve", "should", "ought", "must", "probably", "arguably",
+    "apparently", "presumably", "allegedly", "supposedly",
+}
+
+# Retained verbatim as the fallback, and as a floor: even with NLTK present
+# these must be treated as subjective.
+_HAND_WRITTEN_SUBJECTIVE = {
     "beautiful", "ugly", "best", "worst", "greatest", "amazing", "terrible",
     "wonderful", "awful", "boring", "interesting", "important", "nice",
     "better", "worse", "favourite", "favorite", "stunning", "lovely",
-    "seem", "feel", "believe", "think", "deserve", "should", "ought",
 }
+
+
+def _load_subjective_lexicon() -> set[str]:
+    """
+    Opinion Lexicon ∪ epistemic markers, or the hand-written floor if NLTK is
+    not installed. Loaded once at import; the corpus is ~200 KB of plain text.
+
+        python -c "import nltk; nltk.download('opinion_lexicon')"
+    """
+    lexicon = set(_HAND_WRITTEN_SUBJECTIVE) | _EPISTEMIC_MARKERS
+
+    try:
+        from nltk.corpus import opinion_lexicon
+        words = set(opinion_lexicon.words())      # raises if corpus is missing
+        lexicon |= {w.lower() for w in words}
+        print(f"[NER] Subjectivity lexicon: {len(lexicon)} words "
+              f"(NLTK opinion_lexicon + epistemic markers).")
+    except Exception as e:
+        print(f"[NER] NLTK opinion_lexicon unavailable ({type(e).__name__}); "
+              f"using the built-in {len(lexicon)}-word list. "
+              f"Run: python -c \"import nltk; nltk.download('opinion_lexicon')\"")
+
+    return lexicon
+
+
+_SUBJECTIVE_LEMMAS = _load_subjective_lexicon()
 
 
 # A sentence ending in one of these is cut off, whatever the tagger decided.
@@ -186,6 +472,15 @@ _TRUNCATING_FINAL_WORDS = {
     # conjunctions and relativisers
     "and", "or", "but", "which", "who", "whom", "whose", "because", "while",
 }
+
+
+# Length bounds for a single atomic claim, previously the inline `3 <= len(doc)
+# <= 60`. The lower bound rejects fragments; the upper bound is a proxy for
+# atomicity — a 60-token "claim" is a paragraph and will contain several
+# relations, which defeats the point of decomposition. Both are cheap to sweep
+# offline: run check_fluency over a labelled set and count false rejections.
+MIN_CLAIM_TOKENS = 3
+MAX_CLAIM_TOKENS = 60
 
 
 def check_fluency(claim: str) -> str | None:
@@ -234,7 +529,7 @@ def check_fluency(claim: str) -> str | None:
     ):
         return "it ends mid-phrase and appears truncated"
 
-    if not (3 <= len(doc) <= 60):
+    if not (MIN_CLAIM_TOKENS <= len(doc) <= MAX_CLAIM_TOKENS):
         return "it is too short or too long to be a single atomic claim"
 
     return None
@@ -348,9 +643,14 @@ def check_worthy(claim: str) -> str | None:
     if has_proper_noun or has_number:
         return None
 
+    # Match on BOTH the lemma and the surface form. The epistemic markers are
+    # lemmas ('seem' catches 'seems', 'seemed'), but the Opinion Lexicon stores
+    # surface forms, and lemmatising an adjective can move it off the entry —
+    # so checking only one of the two would silently miss half the vocabulary.
     subjective = {
-        t.lemma_.lower() for t in doc
-        if t.lemma_.lower() in _SUBJECTIVE_LEMMAS
+        t.lemma_.lower() for t in doc if t.lemma_.lower() in _SUBJECTIVE_LEMMAS
+    } | {
+        t.text.lower() for t in doc if t.text.lower() in _SUBJECTIVE_LEMMAS
     }
     if subjective:
         return (
@@ -424,8 +724,36 @@ def _subject_span(head) -> str:
     while end + 1 in keep:
         end += 1
 
+    # Over the limit, fall back to the HEAD NOUN rather than slicing the phrase.
+    #
+    # The cap used to truncate positionally, which produced query terms that
+    # mean nothing: "The title of the world's longest river" is 8 tokens, so a
+    # cap of 7 emitted "title of the world's longest" and the query anchored on
+    # a dangling adjective. No value of the cap fixes that — 8 tokens fails at
+    # 9 — because the bug is the behaviour at the boundary, not its position.
+    #
+    # "river" is a weak anchor, but it is a real noun phrase; "longest" is not.
+    # Degrading to something smaller and correct beats something longer and
+    # malformed, and it leaves the entity path free to supply a better anchor.
     if end - start + 1 > _MAX_SUBJECT_TOKENS:
-        end = start + _MAX_SUBJECT_TOKENS - 1
+        # The head of an OVERLONG subject phrase is generic by construction:
+        # phrases get long precisely because the head is vague and needs
+        # qualifying. "The title of the world's longest river" heads on
+        # 'title'; "the city of the seven hills" on 'city'.
+        #
+        # Returning that head made retrieval WORSE than doing nothing —
+        # promotion put the bare word 'title' ahead of 'the Amazon River' and
+        # the retriever fetched an article about titles. Only a proper noun is
+        # worth promoting; anything else yields None so the entity path takes
+        # over cleanly.
+        if head.pos_ == "PROPN":
+            print(f"[NER] Subject phrase exceeds {_MAX_SUBJECT_TOKENS} tokens — "
+                  f"falling back to the proper-noun head '{head.text}'.")
+            return head.text
+
+        print(f"[NER] Subject phrase exceeds {_MAX_SUBJECT_TOKENS} tokens and heads "
+              f"on the common noun '{head.text}' — no subject promoted.")
+        return ""
 
     return doc[start:end + 1].text
 
@@ -478,6 +806,77 @@ def extract_subject(fact: str) -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 3 — Query Construction
 # ─────────────────────────────────────────────────────────────────────────────
+# ── Tunable query-construction parameters ─────────────────────────────────────
+# MAX_QUERY_ENTITIES was the literal `filtered_entities[:2]` inside
+# build_query(). It is the single most consequential number in the retrieval
+# path — it decides which entities survive into the search string — and it was
+# invisible. Two is a genuine trade-off, not an obvious default:
+#
+#   fewer  → generic queries that return huge topic articles
+#            ('Africa Europe' retrieved a migration-patterns passage)
+#   more   → over-specification; no article contains every term
+#
+# It interacts with ENTITY_PRIORITY: the cap only matters because entities are
+# ranked, and a mis-ranked entity beyond the cap is discarded entirely. That is
+# how 'Yavuz Sultan Selim Bridge' (ORG, 3) lost to 'Africa'/'Europe' (LOC, 4)
+# and never reached the index.
+#
+# Raised from 2 to 3 because EXCLUSION was the only harm ranking ever did.
+# extract_queries() already issues a standalone query per surviving entity, so
+# a mis-ranked entity that stays inside the cap costs nothing — it still gets
+# its own lookup. An entity pushed outside the cap is never searched for at
+# all, which is unrecoverable. Widening it converts a ranking problem into an
+# ordering preference, at the price of one extra Wikipedia call (~5-15s against
+# ~190s verifications).
+MAX_QUERY_ENTITIES = 3
+
+
+def _specificity(entity: str) -> tuple[int, int, int]:
+    """
+    Sort key ranking an entity string by how narrowly it identifies an article.
+
+    Replaces ENTITY_PRIORITY's role in ORDERING (the table still gates DATE
+    entities in filter_entities). The type table asserted a total order over
+    categories — PERSON > FAC > LOC > ORG — that does not exist: a person is
+    not inherently a better search anchor than a place. What actually predicts
+    a good anchor is SPECIFICITY, which is a property of the individual string,
+    not of its predicted category.
+
+    Worked example, "Europe connects to Asia by a land bridge called Yavuz
+    Sultan Selim Bridge":
+
+        entity                     by type   by grammatical role   here
+        Europe                     1st       1st (subject)         3rd
+        Asia                       2nd       2nd (object)          2nd
+        Yavuz Sultan Selim Bridge  3rd       3rd (oblique)         1st
+
+    Only the last column is right — and note that grammatical role gets it
+    exactly backwards here, because the specific entity sits in a prepositional
+    phrase while two continents occupy subject and object. Role answers "what
+    is this claim about?" (which is why subject promotion still runs first, and
+    why diagnose_nei uses it); it does not answer "what is a good search term?"
+
+    Signals, in order of the tuple, all descending:
+      1. token count      — multi-token names identify fewer articles
+      2. title-cased      — a proper name rather than a common noun
+      3. character length — a weak tiebreak, longer strings are rarer
+
+    Deliberately no corpus frequency: that would need an index or a download,
+    and these three are computable from the string alone.
+    """
+    tokens = entity.split()
+    return (
+        len(tokens),
+        sum(1 for t in tokens if t[:1].isupper()),
+        len(entity),
+    )
+
+
+def _by_specificity(entities: list[str]) -> list[str]:
+    """Most specific first. Stable, so equal keys keep ENTITY_PRIORITY order."""
+    return sorted(entities, key=_specificity, reverse=True)
+
+
 def _sanitize_query(text: str) -> str:
     """
     Shared query sanitizer used by build_query() and extract_queries().
@@ -508,8 +907,7 @@ def build_query(filtered_entities: list[str], fact: str) -> str | None:
     if not filtered_entities:
         return None
 
-    # Cap at top 2 entities to maintain search breadth while ensuring query precision
-    top_entities = filtered_entities[:2]
+    top_entities = filtered_entities[:MAX_QUERY_ENTITIES]
 
     query = _sanitize_query(" ".join(top_entities))
 
@@ -577,21 +975,37 @@ def extract_query(fact: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 6 — Multi-Query Extraction (used by retriever.fetch)
 # ─────────────────────────────────────────────────────────────────────────────
-def extract_queries(fact: str, max_queries: int = 3) -> list[str]:
+def extract_queries(fact: str, max_queries: int = MAX_QUERY_ENTITIES + 1) -> list[str]:
     """
     Multi-query variant of extract_query() for robust retrieval.
 
     Single-query retrieval has a brittle failure mode: the query anchors on
-    the top-2 priority entities, so ONE hallucinated or mis-typed entity
+    the top priority entities, so ONE hallucinated or mis-typed entity
     poisons the entire evidence pool for the fact. Observed examples:
     "Gustave Eiffel Bedford Basin" retrieved a World Heritage Sites list,
     and spaCy tagging "Statue of Liberty" as ORG dropped it from the top-2
     cut entirely. Issuing an additional standalone query per top entity
     means at least one query still lands on the right article.
 
+    ORDERING IS NOW TWO-STAGE, and the two stages answer different questions:
+
+        subject promotion  — "what is this claim ABOUT?"      (grammatical role)
+        _by_specificity    — "what is a good SEARCH TERM?"    (string properties)
+
+    The subject goes first because a claim's subject must always be searched
+    for. Everything after it is ordered by specificity rather than by
+    ENTITY_PRIORITY, because entity TYPE predicts neither question well —
+    'Yavuz Sultan Selim Bridge' is tagged ORG and outranked by the continents
+    it connects, though it names exactly one article and they name vast ones.
+
+    The default max_queries tracks MAX_QUERY_ENTITIES so that every entity
+    surviving the cap gets its own standalone lookup; otherwise widening the
+    cap would admit an entity to the combined query while still denying it a
+    query of its own.
+
     Returns (deduplicated, priority order):
-        1. The combined top-2 entity query (same as extract_query)
-        2. One standalone query per top-2 entity — date entities excluded,
+        1. The combined query over the top MAX_QUERY_ENTITIES entities
+        2. One standalone query per surviving entity — date entities excluded,
            since a bare "1889" retrieves the year article (pure noise)
         3. Keyword fallback if nothing else was produced
     """
@@ -635,7 +1049,9 @@ def extract_queries(fact: str, max_queries: int = 3) -> list[str]:
         ]
         if filtered[:1] != [subject]:
             print(f"[NER] Promoting subject '{subject}' to the head of the query.")
-        filtered = [subject] + rest
+        filtered = [subject] + _by_specificity(rest)
+    else:
+        filtered = _by_specificity(filtered)
 
     queries: list[str] = []
 
@@ -643,7 +1059,7 @@ def extract_queries(fact: str, max_queries: int = 3) -> list[str]:
     if combined:
         queries.append(combined)
 
-    for ent_text in filtered[:2]:
+    for ent_text in filtered[:MAX_QUERY_ENTITIES]:
         if len(queries) >= max_queries:
             break
         q = _sanitize_query(ent_text)

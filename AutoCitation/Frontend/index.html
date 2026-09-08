@@ -719,12 +719,18 @@
               <span class="meta-key">Timing</span>
               <span class="meta-value">${timingLine}</span>
             </div>` : ""}
+            <!-- source_url is "" when nothing was retrieved: an extraction
+                 failure, an unverifiable claim, or a lookup that found no
+                 article. Rendering an anchor anyway produced a link to the
+                 current page that looked like a citation. Say there is no
+                 source instead of implying there is one. -->
             <div class="meta-line">
               <span class="meta-key">Source</span>
               <span class="meta-value">
+                ${result.source_url ? `
                 <a href="${escapeHtml(result.source_url)}" target="_blank" rel="noopener">
                   ${escapeHtml(result.source_url)}
-                </a>
+                </a>` : `<em class="no-source">no source — this claim was never checked against evidence</em>`}
               </span>
             </div>
             <div class="meta-line">

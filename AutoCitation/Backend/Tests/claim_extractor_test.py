@@ -27,6 +27,40 @@ def test_article_variants_collapse():
     assert a == b
 
 
+def test_diagnose_nei_anchors_on_the_name_not_the_longest_word():
+    """
+    'English settlement of Jamestown' — the longest token is 'settlement' (10)
+    and the name is 'Jamestown' (9). The previous max-by-length heuristic
+    therefore searched the evidence for 'settlement', found it in a colonial
+    passage that never mentioned Jamestown, and reported GENUINE.
+
+    GENUINE means "the right evidence was retrieved and is authentically
+    silent", which is terminal — no better query will help. RETRIEVAL_FAILURE
+    means "try again". Getting this backwards tells the operator to stop looking
+    at precisely the moment retrieval needs fixing.
+    """
+    chunks = [
+        "Spain and Portugal established a permanent settlement in the New World "
+        "long before other European powers attempted one."
+    ]
+    assert ce.diagnose_nei(
+        "The English settlement of Jamestown paved the way for European presence.",
+        chunks,
+    ) == "RETRIEVAL_FAILURE"
+
+
+def test_diagnose_nei_reports_genuine_when_the_name_is_present():
+    """The other direction: the name IS in the evidence, so NEI is a verdict."""
+    chunks = [
+        "The Jamestown settlement in the Colony of Virginia was the first "
+        "permanent English settlement in the Americas."
+    ]
+    assert ce.diagnose_nei(
+        "The English settlement of Jamestown paved the way for European presence.",
+        chunks,
+    ) == "GENUINE"
+
+
 def test_leading_article_collapses():
     assert ce._normalize_claim("Bosporus is located in Turkey.") == \
            ce._normalize_claim("The Bosporus is located in Turkey.")
@@ -50,10 +84,69 @@ def test_punctuation_and_case_are_ignored():
 # _content_words — the faithfulness gate's vocabulary
 # ═════════════════════════════════════════════════════════════════════════════
 def test_short_words_are_excluded():
-    """Words of 3 characters or fewer are dropped, so 'the'/'and'/'is' never appear."""
+    """
+    Words shorter than MIN_CONTENT_WORD_LENGTH are dropped before stemming, so
+    'the' / 'and' / 'is' never enter the comparison.
+
+    Content words are asserted by PREFIX, not as literals and not through
+    _stem. Three backends have produced three different keys for the same word
+    — 'europe' (lemma), 'europ' (Snowball), 'europe' (suffix stripper) — and
+    each time this test was pinned to one of them it broke when the backend
+    changed. A prefix check asserts what the function is for (the word survived
+    in some normalised form) without asserting which normaliser is configured.
+    """
     words = ce._content_words("The Bosporus separates Africa and Europe.")
-    assert not any(len(w) <= 3 for w in words)
-    assert "africa" in words and "europe" in words
+
+    assert not {"the", "and", "is"} & words
+    assert any(w.startswith("africa") for w in words)
+    assert any(w.startswith("europ") for w in words)
+
+
+def test_proper_nouns_survive_normalisation():
+    """
+    The benchmark's set C, as an invariant.
+
+    Every stemmer mangles these: Paris->pari, Athens->athen, Wales->wale,
+    Bosporus->bosporu. A mangled name stops matching its own mention in the
+    evidence, which is fatal in a domain made of place names.
+    """
+    words = ce._content_words(
+        "The Bosporus is near Athens, Paris, Wales and the Netherlands."
+    )
+    for name in ("bosporus", "athens", "paris", "wales", "netherlands"):
+        assert name in words, f"{name} was normalised away"
+
+
+def test_lemma_mode_still_collapses_inflections():
+    """Proper-noun preservation must not cost inflectional matching."""
+    assert ce._content_words("separates") == ce._content_words("separated")
+    assert ce._content_words("boundaries") == ce._content_words("boundary")
+
+
+def test_over_stemming_traps_stay_distinct():
+    """
+    Set B as an invariant. Snowball, Porter and Lancaster all collapse
+    'organization' into 'organ', which lets an invented word hide inside a
+    word the source happens to contain.
+    """
+    assert ce._content_words("organization") != ce._content_words("organ")
+    assert ce._content_words("university") != ce._content_words("universe")
+
+
+def test_stemmer_backend_is_resolved():
+    """
+    _stem is chosen once at import: Snowball when NLTK is present, the
+    four-suffix stripper otherwise. Either way it must be callable, because a
+    missing NLTK should degrade the gate's strictness, never crash the request.
+    """
+    assert callable(ce._stem)
+    assert ce._stem("separates")            # non-empty for a normal word
+
+
+def test_suffix_fallback_still_works():
+    """The no-NLTK path must remain functional even when Snowball is active."""
+    assert ce._suffix_stem("separates") == "separat"
+    assert ce._suffix_stem("axes") == "axes"     # MIN_STEM_LENGTH protects it
 
 
 def test_inflections_are_stemmed_together():
@@ -70,6 +163,25 @@ def test_foreign_entity_is_detectable():
     source = ce._content_words("Bosporus is located between Africa and Europe.")
     claim = ce._content_words("Bosporus is located between Asia and Europe.")
     assert claim - source - ce.FUNCTION_WORDS == {"asia"}
+
+
+def test_negation_is_invisible_to_the_gate():
+    """
+    Documents a real limitation, not desired behaviour.
+
+    MIN_CONTENT_WORD_LENGTH is 4, and 'not' is three characters, so inserting
+    or deleting a negation leaves no trace in the word set. An observed run
+    turned "It is universally acknowledged as longer than the Nile" into "The
+    Nile is NOT universally acknowledged as the world's longest river" — a
+    complete reversal — and the gate passed it.
+
+    When a dedicated negation check is added this test should fail, and that
+    failure is the signal to delete it.
+    """
+    assert ce.MIN_CONTENT_WORD_LENGTH > len("not")
+    positive = ce._content_words("The Nile is the longest river.")
+    negated = ce._content_words("The Nile is not the longest river.")
+    assert positive == negated, "gate can now see negation — replace this test"
 
 
 def test_faithful_claim_leaves_no_residue():
