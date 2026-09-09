@@ -224,3 +224,51 @@ def test_next_fact_index_is_interpolated():
     """The instruction text renumbers itself; the prompt is never static."""
     prompt = ce.build_extraction_prompt(DOC, ["a", "b"], ["SUPPORTS", "REFUTES"], ["r1", "r2"])
     assert "Fact_3" in prompt
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# diagnose_nei — which token stands in for the subject
+# ═════════════════════════════════════════════════════════════════════════════
+def test_diagnosis_anchors_on_the_name_not_the_longest_word():
+    """
+    'English settlement of Jamestown' — longest token is 'settlement' (10), the
+    name is 'Jamestown' (9). Anchoring on length searched the evidence for
+    'settlement', found it in a passage that never mentions Jamestown, and
+    reported GENUINE.
+
+    The two diagnoses call for opposite responses. GENUINE is terminal: the
+    right evidence was retrieved and is authentically silent, so no better query
+    will help. RETRIEVAL_FAILURE means try again. Confusing them tells the
+    operator to stop looking at the moment retrieval needs fixing.
+    """
+    chunks = [
+        "Spain and Portugal established a permanent settlement in the New World "
+        "long before other European powers attempted one."
+    ]
+    assert ce.diagnose_nei(
+        "The English settlement of Jamestown paved the way for European presence.",
+        chunks,
+    ) == "RETRIEVAL_FAILURE"
+
+
+def test_diagnosis_reports_genuine_when_the_name_is_present():
+    """The other direction: the name IS in the evidence, so NEI is a verdict."""
+    chunks = [
+        "The Jamestown settlement in the Colony of Virginia was the first "
+        "permanent English settlement in the Americas."
+    ]
+    assert ce.diagnose_nei(
+        "The English settlement of Jamestown paved the way for European presence.",
+        chunks,
+    ) == "GENUINE"
+
+
+def test_diagnosis_falls_back_to_length_without_a_proper_noun():
+    """
+    "water molecules" has no PROPN, so length remains the best available proxy
+    for rarity. The fallback must still work rather than raising.
+    """
+    assert ce.diagnose_nei(
+        "Water molecules are held together by hydrogen bonds.",
+        ["Ionic bonds form between oppositely charged particles."],
+    ) in {"RETRIEVAL_FAILURE", "GENUINE", "UNKNOWN"}

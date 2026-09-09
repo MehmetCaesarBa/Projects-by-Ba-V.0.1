@@ -522,8 +522,42 @@ def _subject_span(head) -> str:
     while end + 1 in keep:
         end += 1
 
+    # OVER-LONG SPANS ARE NOT TRUNCATED — they are abandoned.
+    #
+    # This used to clip to the first _MAX_SUBJECT_TOKENS tokens, which turns a
+    # too-long span into a MID-PHRASE FRAGMENT. Observed on
+    #
+    #   "The title of the world's longest river belongs to the Amazon River."
+    #
+    # the subject span ran past the cap and was clipped to
+    #
+    #   'title of the world's longest'
+    #
+    # — cut before the noun it modifies. That fragment was then promoted to the
+    # head of the search query, producing 'title of the world longest the Amazon
+    # River': three queries, 66 chunks across 5 articles, to answer a claim
+    # whose only real anchor is 'Amazon River'. It happened to score 0.86 and
+    # find the right passage, which is luck, not design.
+    #
+    # A fragment is worse than nothing here, because the query builder cannot
+    # tell the difference and will faithfully search for it. So when the span
+    # overruns, fall back to the head token alone — and only if the head is a
+    # PROPER NOUN, i.e. a name worth searching for.
+    #
+    # The PROPN condition is the part that took two attempts. Falling back to
+    # the bare head noun unconditionally gave 'title' for the sentence above:
+    # still not the entity, still promoted to the front of the query, and now
+    # generic enough to match anything. A common-noun head means the parse found
+    # a description rather than a name, and the honest answer is that no subject
+    # was recovered — the entity path still has NER to fall back on.
     if end - start + 1 > _MAX_SUBJECT_TOKENS:
-        end = start + _MAX_SUBJECT_TOKENS - 1
+        if head.pos_ == "PROPN":
+            print(f"[NER] Subject span exceeds {_MAX_SUBJECT_TOKENS} tokens — "
+                  f"falling back to the proper noun '{head.text}'.")
+            return head.text
+        print(f"[NER] Subject phrase exceeds {_MAX_SUBJECT_TOKENS} tokens and heads "
+              f"on the common noun '{head.text}' — no subject promoted.")
+        return ""
 
     return doc[start:end + 1].text
 
@@ -576,6 +610,131 @@ def extract_subject(fact: str) -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 3 — Query Construction
 # ─────────────────────────────────────────────────────────────────────────────
+# ── Intent-aware query planning ───────────────────────────────────────────────
+# Superlative and ordinal markers. A claim carrying one of these asserts
+# UNIQUENESS within a category, and that is the class this whole mechanism
+# exists for.
+#
+# Detected by TAG rather than by a word list wherever possible: JJS is the
+# superlative adjective tag ('tallest', 'earliest', 'largest'), RBS the
+# superlative adverb ('most', 'least'). The lexicon covers what the tagger
+# misses — 'first' and 'only' are usually tagged ORDINAL or ADJ, and 'sole' and
+# 'unique' are plain adjectives, yet all four assert the same uniqueness.
+_SUPERLATIVE_TAGS = {"JJS", "RBS"}
+_SUPERLATIVE_LEMMAS = {
+    "first", "earliest", "oldest", "last", "latest", "only", "sole",
+    "unique", "foremost", "premier", "original",
+}
+
+# Words that describe the claim's rhetorical framing rather than its content.
+# 'Jamestown is CELEBRATED AS the earliest...' — the celebrating is not what
+# needs looking up, the chronology is. Dropping them shortens the query to the
+# assertion itself.
+_FRAMING_LEMMAS = {
+    "celebrate", "know", "regard", "consider", "recognise", "recognize",
+    "acknowledge", "describe", "call", "name", "say", "believe", "report",
+    "widely", "universally", "commonly", "generally", "often", "traditionally",
+}
+
+# Upper bound on the predicate query. Wikipedia's search degrades on long
+# strings, and past this length the query stops naming a category and starts
+# paraphrasing the claim — which retrieves the claim's own subject again, the
+# exact failure this is meant to avoid.
+_MAX_PREDICATE_TOKENS = 8
+
+
+def build_predicate_query(fact: str) -> str | None:
+    """
+    A query for the CATEGORY a superlative claim ranks within, not for its subject.
+
+    Returns None when the claim carries no superlative or ordinal — most claims
+    do not, and for those the existing entity-anchored queries are correct.
+
+    WHY THIS EXISTS. Queries are built from the claim's named entities, and a
+    claim's entities describe its SUBJECT. That is fine when the claim names
+    both sides of a comparison:
+
+        "The Amazon is longer than the NILE"  ->  query 'Amazon River Nile'
+                                              ->  List of river systems by length
+                                              ->  REFUTES, correctly
+
+    A superlative names only one side. The competitor is implicit, so there is
+    nothing in the claim to retrieve it with:
+
+        "Jamestown is the earliest EUROPEAN settlement in the United States"
+                                              ->  query 'English settlement of Jamestown'
+                                              ->  articles about Jamestown
+                                              ->  SUPPORTS, wrongly
+
+    Evidence that would REFUTE that claim is a passage about Saint Augustine —
+    and a passage about Saint Augustine does not contain the word 'Jamestown'.
+    The most discriminating term in the query is precisely the term the
+    counter-evidence is structurally unable to hold, so no amount of ranking,
+    reranking or top-k tuning can surface it. The query has to change.
+
+    So: strip the subject and the framing, keep the superlative and what it
+    ranges over.
+
+        "earliest European permanent settlement United States"
+
+    That asks "who actually was first?" instead of "tell me about Jamestown",
+    and it is the query that finds Saint Augustine.
+
+    DETERMINISTIC ON PURPOSE — no model call. It runs on a parse the pipeline
+    already computes, costs no inference, and is testable offline. An LLM could
+    write a more fluent query, but it would cost ~10s per claim and could not be
+    unit-tested, and this is the cheapest thing that addresses the class.
+
+    The result is an ADDITIONAL query, never a replacement: the subject query
+    still has to run, because a claim about Jamestown does need the Jamestown
+    article to confirm the parts that are true.
+    """
+    doc = NLP(fact)
+
+    superlatives = [
+        t for t in doc
+        if t.tag_ in _SUPERLATIVE_TAGS or t.lemma_.lower() in _SUPERLATIVE_LEMMAS
+    ]
+    if not superlatives:
+        return None
+
+    # Everything the subject's subtree covers is dropped: the claim's subject is
+    # what the existing queries already retrieve, and including it here would
+    # reproduce them.
+    subject_indices: set[int] = set()
+    for token in doc:
+        if token.dep_ in ("nsubj", "nsubjpass"):
+            subject_indices |= {t.i for t in token.subtree}
+
+    start = min(t.i for t in superlatives)
+
+    keep = []
+    for token in doc[start:]:
+        if token.i in subject_indices or token.is_punct or token.is_space:
+            continue
+        if token.is_stop or token.lemma_.lower() in _FRAMING_LEMMAS:
+            continue
+        # Keep content words only. Adjectives matter here as much as nouns —
+        # 'earliest', 'European' and 'permanent' are the qualifiers that define
+        # the category, and dropping them would query 'settlement United States'.
+        if token.pos_ in ("NOUN", "PROPN", "ADJ", "NUM"):
+            keep.append(token.text)
+        if len(keep) >= _MAX_PREDICATE_TOKENS:
+            break
+
+    if len(keep) < 2:
+        # A single surviving word is the superlative alone ('the tallest'), which
+        # names no category and would retrieve a disambiguation page.
+        return None
+
+    query = _sanitize_query(" ".join(keep))
+    if not query:
+        return None
+
+    print(f"[NER] Superlative claim — predicate query: '{query}'")
+    return query
+
+
 def _sanitize_query(text: str) -> str:
     """
     Shared query sanitizer used by build_query() and extract_queries().
@@ -749,6 +908,22 @@ def extract_queries(fact: str, max_queries: int = 3) -> list[str]:
         if not q or re.fullmatch(r'[\d\s\-–to]+', q) or q in queries:
             continue
         queries.append(q)
+
+    # INTENT-AWARE QUERY, appended last.
+    #
+    # Last, not first, and additional rather than replacing anything: the
+    # entity-anchored queries are what confirm the parts of a claim that are
+    # true, and they stay correct. This one exists only to reach the evidence
+    # they structurally cannot — see build_predicate_query.
+    #
+    # It is allowed to exceed max_queries. That cap bounds how many entity
+    # lookups a claim may spend, and a superlative claim asking one question the
+    # other queries cannot ask is not the thing the cap is protecting against.
+    # Cost is one Wikipedia fetch (~5-15s) against verifications that run
+    # 100-600s.
+    predicate_query = build_predicate_query(fact)
+    if predicate_query and predicate_query not in queries:
+        queries.append(predicate_query)
 
     if not queries:
         print("[NER] Structural resolution failed. Triggering semantic keyword fallback extraction.")

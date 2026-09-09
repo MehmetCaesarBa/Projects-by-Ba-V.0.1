@@ -59,8 +59,33 @@ VERIFIER_NUM_CTX = 8192
 
 # Output ceiling. With thinking disabled the answer is three short lines, so a
 # tight cap costs nothing and bounds a runaway generation. With thinking on the
-# budget must also cover the <think> block, hence the conditional.
-VERIFIER_NUM_PREDICT = 256 if VERIFIER_THINKING is False else 1024
+# budget must ALSO cover the <think> block — and 1024 was too tight.
+#
+# MEASURED, not guessed. Two observed runs:
+#
+#   [Inference] qwen3:8b  output 1024 tok in 263.7s
+#   [Verifier] Raw model response:            <- empty
+#
+#   [Inference] qwen3:8b  output 2063 tok in 370.9s   (verifier_probe, same claim)
+#
+# The first is exactly at the ceiling: cut off mid-reasoning, 264 seconds spent,
+# nothing returned. The strip regex then found an unterminated <think> and left
+# an empty string, and parse_verification_response fell back to its default —
+# so the pipeline printed
+#
+#   [Verifier] Label     : NOT ENOUGH INFO
+#   [Verifier] Rationale :                    <- blank
+#
+# A CRASH THAT READS AS A JUDGEMENT. In the final report that row is
+# indistinguishable from "the evidence was genuinely inconclusive", which is the
+# single most misleading thing this pipeline can output: it is not a weak
+# verdict, it is no verdict at all.
+#
+# The probe measurement says the hard cases want ~2000 tokens, so 1024 does not
+# merely clip the tail — it truncates the reasoning that decides the answer. Set
+# to 3072 for headroom, and verify() now DETECTS the case explicitly rather than
+# letting it masquerade as a label.
+VERIFIER_NUM_PREDICT = 256 if VERIFIER_THINKING is False else 3072
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,6 +132,76 @@ def build_verification_prompt(fact: str, evidence_chunks: list[str]) -> str:
     Builds the reasoning prompt based on AFEV Figure 4.
     Presents the fact and all evidence chunks to the reasoning model.
     Instructs it to select the most relevant chunk and judge the fact against it.
+
+    RULE 6 IS THE OVER-REFUTATION FIX. Observed:
+
+        claim    "The title of the world's longest river belongs to the Amazon."
+        evidence "...the second-longest or longest river system in the world,
+                  a title which is disputed with the Nile."
+        verdict  REFUTES
+        reason   "...directly contradicting the claim that the Amazon holds the
+                  title UNAMBIGUOUSLY."
+
+    'Unambiguously' is not in the claim. The model supplied a strength qualifier
+    the claim never asserted and then refuted its own addition. That mechanism
+    is also why the previous wording — "only output REFUTES when a chunk
+    explicitly and unambiguously contradicts the claim" — did not prevent it:
+    the model believed it HAD found an unambiguous contradiction, of a claim it
+    had silently strengthened first.
+
+    So the rule now constrains two things instead of one: what counts as a
+    contradiction (something that cannot hold simultaneously, not something that
+    declines to confirm), and what the claim is permitted to mean (exactly what
+    it says). Evidence that reports a question as OPEN is named explicitly,
+    because 'disputed' is the textbook NOT ENOUGH INFO signal and nothing in
+    this prompt had ever said so — rule 5 covers chunks contradicting EACH
+    OTHER, not a single chunk reporting an open question.
+
+    VALIDATED BY verifier_probe.py before shipping, on four cases: the disputed
+    river (now NOT ENOUGH INFO, was REFUTES) plus two controls that must not
+    move — a claim the evidence genuinely refutes, and a narrower statement that
+    legitimately entails a broader one ("founded on May 14, 1607" does establish
+    "founded in May 1607"). A rule that fixes over-refutation by answering NOT
+    ENOUGH INFO to everything would pass the first case and destroy the system;
+    the controls are what catch that.
+
+    THE SUPPORTS CLAUSE EXISTS BECAUSE THE FIRST VERSION LEANED ON THE SCALE.
+    Every clause of rule 6 as first written pushed AWAY FROM REFUTES, and
+    nothing in it pushed away from SUPPORTS. It fixed the Amazon over-refutation
+    and, on the next run, a claim that had correctly come back NOT ENOUGH INFO
+    on identical evidence turned into SUPPORTS:
+
+        claim    "...the earliest EUROPEAN permanent settlement in what is now
+                  the United States"
+        evidence "...the first permanent ENGLISH settlement in the Americas"
+        reason   "...which includes the United States. This supports the claim."
+
+    English settlements are SOME European settlements, so being first among them
+    says nothing about being first among all of them — an earlier Spanish or
+    French settlement is not ruled out by that sentence. The model checked the
+    geographic scope (Americas ⊇ United States, correct) and treated the
+    narrower nationality as a detail rather than as the thing at issue.
+
+    A rule that only restrains one label does not make the verifier careful, it
+    makes it biased. Both directions now carry the same bar: evidence about a
+    narrower group settles nothing about a wider one, whichever way it points.
+
+    Kept as sub-clauses of rule 6 rather than as rules 7 and 8. An earlier rule 7
+    on qualifier checking was withdrawn partly because seven unordered
+    instructions competed for attention, and piling more on would repeat that.
+
+    WHAT THIS CANNOT FIX, stated so the next reader does not try: with only
+    Jamestown-centric evidence in the prompt, NOT ENOUGH INFO is the BEST
+    available answer, not the correct one. Refuting the claim needs the passage
+    about Saint Augustine (1565), and retrieval cannot find it — the query is
+    built from the claim's entities, and a passage about a different settlement
+    does not contain the claim's subject. That is a retrieval problem and no
+    verifier prompt reaches it.
+
+    THE WORKED EXAMPLE MUST NOT COME FROM THE TEST SET. Marlow Tower and Kessler
+    Building are invented for this purpose. Using a project test sentence would
+    show the model the answer to a question it is about to be asked, and that
+    case would then measure nothing.
     """
     chunks_block = ""
     for i, chunk in enumerate(evidence_chunks, 1):
@@ -126,7 +221,34 @@ Instructions:
 3. Based strictly on that chunk, determine the verification label.
 4. Do not use your internal knowledge — base your judgment solely on the evidence provided.
 5. If the evidence chunks contradict each other on the point in question, or none of them directly addresses the claim's subject, output NOT ENOUGH INFO rather than guessing.
-6. Only output REFUTES when a chunk explicitly and unambiguously contradicts the claim.
+6. REFUTES REQUIRES A CONTRADICTION, NOT AN ABSENCE OF CONFIRMATION. Output
+   REFUTES only when a chunk states something that CANNOT BE TRUE AT THE SAME
+   TIME as the claim.
+   - Judge the claim exactly as written. Do not read extra strength into it. A
+     plain assertion does not also assert that it is certain, undisputed, or
+     universally agreed, so you may not refute it for failing to be those.
+   - If the chunk presents the point as OPEN — disputed, contested, "X or Y",
+     estimates vary, some sources say, widely believed — then it neither
+     establishes nor contradicts the claim, and the answer is NOT ENOUGH INFO.
+
+   Claim:    "The tallest building in the region is the Marlow Tower."
+   Evidence: "The Marlow Tower is the second-tallest or tallest in the region,
+              a distinction disputed with the Kessler Building."
+   CORRECT   NOT ENOUGH INFO — the evidence reports the question as open.
+   WRONG     REFUTES — nothing there states the Marlow Tower is not tallest.
+
+   THE SAME BAR APPLIES TO SUPPORTS. Being FIRST, LARGEST or OLDEST within a
+   NARROWER group does not establish being first, largest or oldest within a
+   WIDER one. If the claim's group is wider than the evidence's group, the
+   evidence leaves the wider question untouched, and the answer is NOT ENOUGH
+   INFO — no matter how closely the two sentences otherwise match.
+
+   Claim:    "The Marlow Tower was the first stone building in the region."
+   Evidence: "The Marlow Tower was the first GRANITE building in the region."
+   CORRECT   NOT ENOUGH INFO — granite buildings are only some stone buildings,
+             so an earlier stone building of another kind is not ruled out.
+   WRONG     SUPPORTS — granite is a stone, therefore the first granite
+             building is the first stone building. It does not follow.
 
 Output strictly in this format with no extra text:
 LABEL: <SUPPORTS|REFUTES|NOT ENOUGH INFO>
@@ -246,6 +368,36 @@ def verify(fact: str, evidence_chunks: list[str]) -> VerificationResult:
     response = call_ollama(prompt)
 
     print(f"[Verifier] Raw model response:\n{response}")
+
+    # TRUNCATION IS NOT A VERDICT.
+    #
+    # When generation hits num_predict inside the <think> block, the regex that
+    # strips reasoning finds no closing tag, removes everything, and leaves an
+    # empty string. parse_verification_response then falls back to its default
+    # of NOT ENOUGH INFO — which reads in the final report exactly like a
+    # considered judgement that the evidence was inconclusive.
+    #
+    # Observed on the Jamestown input: 267 seconds of generation, an empty raw
+    # response, a blank rationale, and a reported NOT ENOUGH INFO on a claim the
+    # model never actually judged. Nothing in the output distinguished it from
+    # the two genuine NEI verdicts in the same run.
+    #
+    # A missing LABEL means the model never answered. Say so, loudly, and put
+    # the reason in the rationale so it survives into the report rather than
+    # living only in the console.
+    if not re.search(r'LABEL:', response, re.IGNORECASE):
+        print("[Verifier] NO LABEL IN RESPONSE — generation was truncated or empty. "
+              "This is a failure, not a verdict.")
+        return VerificationResult(
+            label="NOT ENOUGH INFO",
+            evidence=evidence_chunks[0] if evidence_chunks else "",
+            rationale=(
+                "VERIFIER FAILURE: the model produced no LABEL line, most likely "
+                "because generation hit the num_predict ceiling inside its "
+                "reasoning block. No verdict was reached for this claim — treat "
+                "it as unchecked, not as unsupported."
+            ),
+        )
 
     result = parse_verification_response(response, evidence_chunks)
 

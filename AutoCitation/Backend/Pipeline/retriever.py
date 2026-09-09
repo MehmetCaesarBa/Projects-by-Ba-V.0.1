@@ -1,5 +1,7 @@
+import math
 import re
 import time
+from collections import Counter
 
 import requests
 import wikipedia
@@ -36,7 +38,7 @@ RETRY_BACKOFF_SECONDS = 1.5
 # ── Wikipedia Retriever config ────────────────────────────────────────────────
 # top_k_results: Number of Wikipedia articles fetched per query.
 # Two articles provide enough surface area to cover multi-hop claims
-# without flooding the chunker with irrelevant documents.
+# without flooding chunk_articles with irrelevant documents.
 TOP_K_ARTICLES = 2
 
 # doc_content_chars_max: Hard character ceiling per fetched Wikipedia article.
@@ -194,14 +196,73 @@ def chunk_articles(articles: list[tuple[str, str]]) -> list[tuple[str, str]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 — Semantic Chunk Scoring
+# STEP 3 — Lexical Chunk Scoring
 # ─────────────────────────────────────────────────────────────────────────────
+# Named "Semantic" until it was noticed that nothing here computes meaning.
+# This is term matching weighted by rarity — a chunk saying "particle
+# accelerator" scores zero against a claim saying "particle collider", because
+# the strings differ. Calling it semantic invites a reader to assume embedding
+# machinery exists somewhere in the project. It does not.
+
+# ── Ranking parameters ────────────────────────────────────────────────────────
+# MIN_SCORE_TOKEN_LENGTH: tokens this short are articles and prepositions that
+# add noise without meaning. Previously the inline `len(t) > 2`.
+MIN_SCORE_TOKEN_LENGTH = 3
+
+# USE_IDF_WEIGHTING: weight each matched token by how RARE it is across the
+# chunks retrieved for this claim, instead of counting every token equally.
+#
+# The unweighted version treated 'bosporus' and 'europe' as worth the same,
+# which is how a passage about African rainfall scored 0.42 against a claim
+# about a strait — it matched 'africa', 'europe' and 'between' while missing the
+# only word that identified the subject. Rare terms are what distinguish a
+# relevant passage; common ones are satisfied by almost anything.
+#
+# The document frequencies come from the ~30-90 chunks just retrieved, not a
+# global corpus. That is deliberate: it needs no index, no download and no
+# dependency, and it is arguably better suited to the task — a term appearing in
+# every chunk fetched for THIS claim is uninformative for choosing between them,
+# whatever its frequency in English at large.
+#
+# KNOWN BIAS, worth stating plainly because it shapes what this can and cannot
+# do: the rarest token in a claim is almost always its SUBJECT NAME, so chunks
+# mentioning the subject dominate. Evidence that would REFUTE "X was first" is
+# typically a passage about someone ELSE, which by construction does not contain
+# X. Rarity weighting therefore sharpens relevance and does nothing for
+# counter-evidence — arguably it makes that harder. Fixing it needs diversity in
+# selection or a differently-built query, not a different weighting.
+#
+# Set False to restore plain term coverage, which is the point of comparison
+# when measuring whether this helped.
+USE_IDF_WEIGHTING = True
+
+
+def _tokenize(text: str) -> set[str]:
+    """Lowercase content tokens used by the ranker."""
+    return {
+        t for t in re.findall(r'\b[a-zA-Z0-9]+\b', text.lower())
+        if len(t) >= MIN_SCORE_TOKEN_LENGTH
+    }
+
+
 def score_chunks(fact: str, chunks: list[tuple[str, str]]) -> list[tuple[float, str, str]]:
     """
-    Scores each chunk against the atomic fact using token-level overlap.
+    Scores each chunk against the atomic fact by IDF-weighted term coverage.
 
-    Scoring formula (Jaccard-inspired coverage of the claim):
-        score = |fact_tokens ∩ chunk_tokens| / |fact_tokens|
+    Scoring formula:
+        score = Σ idf(t) for t in (fact ∩ chunk)  /  Σ idf(t) for t in fact
+
+    where idf(t) = log(1 + N / (1 + df(t))), N = number of chunks retrieved for
+    this claim and df(t) = how many of them contain t.
+
+    The +1 inside the log keeps the weight strictly positive: a term present in
+    every retrieved chunk would otherwise score log(1) = 0, drop out of the
+    denominator entirely, and can make it zero.
+
+    The denominator keeps the score in [0, 1] and preserves its meaning as "how
+    much of the claim this chunk covers", so the printed Top chunk score stays
+    comparable in magnitude to earlier runs — but a chunk now has to cover the
+    claim's DISTINCTIVE words to score highly, not merely three common ones.
 
     Args:
         fact   : atomic claim string from claim_extractor
@@ -215,13 +276,7 @@ def score_chunks(fact: str, chunks: list[tuple[str, str]]) -> list[tuple[float, 
         print("[Retriever] No chunks available to score.")
         return []
 
-    # Normalize fact to lowercase token set for case-insensitive matching.
-    # Short tokens (≤2 chars) are excluded as they are typically articles
-    # or prepositions that add noise without semantic value.
-    fact_tokens = {
-        t for t in re.findall(r'\b[a-zA-Z0-9]+\b', fact.lower())
-        if len(t) > 2
-    }
+    fact_tokens = _tokenize(fact)
 
     if not fact_tokens:
         # If the fact contains no meaningful tokens after filtering,
@@ -229,22 +284,33 @@ def score_chunks(fact: str, chunks: list[tuple[str, str]]) -> list[tuple[float, 
         print("[Retriever] No scoreable tokens found in fact. Returning unscored chunks.")
         return [(0.0, chunk, url) for chunk, url in chunks]
 
+    chunk_token_sets = [_tokenize(chunk) for chunk, _ in chunks]
+
+    if USE_IDF_WEIGHTING:
+        total = len(chunk_token_sets)
+        df = Counter(t for tokens in chunk_token_sets for t in tokens)
+        weight = {t: math.log(1 + total / (1 + df.get(t, 0))) for t in fact_tokens}
+    else:
+        weight = {t: 1.0 for t in fact_tokens}
+
+    denominator = sum(weight[t] for t in fact_tokens) or 1.0
+
     scored = []
-    for chunk, url in chunks:
-        chunk_tokens = {
-            t for t in re.findall(r'\b[a-zA-Z0-9]+\b', chunk.lower())
-            if len(t) > 2
-        }
-        # Intersection over fact length: measures how much of the claim
-        # is covered by the chunk, not how large the chunk is.
-        overlap = len(fact_tokens & chunk_tokens)
-        score   = overlap / len(fact_tokens)
+    # strict=True: a length mismatch between chunks and their token sets would
+    # silently truncate under plain zip, pairing a chunk with another chunk's
+    # tokens and scoring both wrongly.
+    for (chunk, url), chunk_tokens in zip(chunks, chunk_token_sets, strict=True):
+        matched = fact_tokens & chunk_tokens
+        score = sum(weight[t] for t in matched) / denominator
         scored.append((score, chunk, url))
 
     # Sort descending: highest relevance chunks surface to the top
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    print(f"[Retriever] Top chunk score: {scored[0][0]:.2f}" if scored else "")
+    if scored:
+        mode = "IDF-weighted" if USE_IDF_WEIGHTING else "term-coverage"
+        print(f"[Retriever] Top chunk score: {scored[0][0]:.2f} ({mode})")
+
     return scored
 
 

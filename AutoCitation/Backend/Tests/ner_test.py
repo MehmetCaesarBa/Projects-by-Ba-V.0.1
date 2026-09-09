@@ -256,6 +256,114 @@ def test_query_set_is_deduplicated():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Subject recovery — over-long spans
+# ═════════════════════════════════════════════════════════════════════════════
+def test_overlong_common_noun_subject_is_abandoned_not_truncated():
+    """
+    "The title of the world's longest river belongs to the Amazon River."
+
+    The subject span overruns _MAX_SUBJECT_TOKENS. Clipping it produced
+
+        'title of the world's longest'
+
+    — cut before the noun it modifies — which was then promoted to the head of
+    the query, giving 'title of the world longest the Amazon River'.
+
+    A fragment is worse than no subject, because the query builder cannot tell
+    the difference and searches for it faithfully. The head here is 'title', a
+    common noun, so the parse found a description rather than a name and the
+    honest answer is that no subject was recovered.
+    """
+    subject = ner.extract_subject(
+        "The title of the world's longest river belongs to the Amazon River."
+    )
+    assert subject is None or "Amazon" in subject, subject
+    if subject:
+        assert not subject.lower().startswith("title"), subject
+
+
+def test_query_does_not_contain_the_truncated_fragment():
+    """The consequence the fix is actually for: what reaches Wikipedia."""
+    queries = ner.extract_queries(
+        "The title of the world's longest river belongs to the Amazon River."
+    )
+    assert any("Amazon" in q for q in queries), queries
+    assert not any(q.lower().startswith("title of the world") for q in queries), queries
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# build_predicate_query — intent-aware planning for superlative claims
+# ═════════════════════════════════════════════════════════════════════════════
+def test_superlative_claim_gets_a_category_query():
+    """
+    THE CASE THIS EXISTS FOR. Entity-anchored queries retrieve the claim's
+    subject; evidence refuting "X was first" is a passage about someone else,
+    which by construction does not contain X. The query has to name the
+    CATEGORY instead.
+    """
+    q = ner.build_predicate_query(
+        "Jamestown is celebrated as the earliest European permanent settlement "
+        "in what is now the United States."
+    )
+    assert q is not None
+    low = q.lower()
+    assert "earliest" in low, q
+    assert "settlement" in low, q
+    # The subject is what the existing queries already fetch. Repeating it here
+    # would reproduce them and retrieve the same Jamestown-centric evidence.
+    assert "jamestown" not in low, q
+    # Framing, not content: the celebrating is not what needs looking up.
+    assert "celebrated" not in low, q
+
+
+def test_ordinary_claim_gets_no_predicate_query():
+    """
+    Most claims carry no superlative, and for those the entity queries are
+    correct. Firing on everything would add a useless fetch per claim.
+    """
+    assert ner.build_predicate_query(
+        "The English settlement of Jamestown was founded in May 1607."
+    ) is None
+
+
+def test_explicit_comparison_needs_no_predicate_query_to_work():
+    """
+    A claim that NAMES its competitor already retrieves the comparison article
+    through the ordinary entity path — observed: 'Amazon River Nile' found
+    'List of river systems by length' and produced a correct REFUTES.
+
+    'longer' is a comparative (JJR), not a superlative (JJS), so this must not
+    trigger. The mechanism is for claims whose other side is IMPLICIT.
+    """
+    assert ner.build_predicate_query(
+        "The Amazon River is longer than the Nile."
+    ) is None
+
+
+def test_bare_superlative_is_rejected():
+    """
+    'the tallest' alone names no category and would retrieve a disambiguation
+    page. Fewer than two surviving content words means there is nothing to
+    search for.
+    """
+    assert ner.build_predicate_query("It is the tallest.") is None
+
+
+def test_predicate_query_is_appended_not_substituted():
+    """
+    The subject query still has to run — a claim about Jamestown needs the
+    Jamestown article to confirm the parts of it that are true. The predicate
+    query is additional.
+    """
+    queries = ner.extract_queries(
+        "Jamestown is celebrated as the earliest European permanent settlement "
+        "in what is now the United States."
+    )
+    assert any("Jamestown" in q for q in queries), queries
+    assert any("earliest" in q.lower() for q in queries), queries
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # check_negation — polarity
 # ═════════════════════════════════════════════════════════════════════════════
 def test_inserted_negation_is_rejected():

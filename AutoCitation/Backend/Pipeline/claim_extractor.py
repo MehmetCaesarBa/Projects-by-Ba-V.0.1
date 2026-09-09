@@ -79,23 +79,123 @@ def _normalize_claim(fact: str) -> str:
     return " ".join(w for w in words if w not in _ARTICLES)
 
 
+# ── Tunable parameters of the faithfulness vocabulary ─────────────────────────
+# These were magic numbers inside _content_words. Naming them matters for more
+# than tidiness: a threshold buried in a comprehension is a decision nobody
+# made, nobody documents, and nobody can sweep. You cannot tune what you cannot
+# name — and you cannot cite it either, which is the immediate problem: two
+# comments elsewhere in this file, and ner.check_negation's docstring, already
+# refer to MIN_CONTENT_WORD_LENGTH by name while it existed only as an inline
+# `len(w) <= 3`.
+#
+# MIN_CONTENT_WORD_LENGTH excludes short function words so that 'the', 'and',
+# 'of' never count as material the claim borrowed. It also has a consequence
+# that was invisible while it was inline:
+#
+#   'not' IS THREE CHARACTERS, so the faithfulness gate cannot see negation.
+#
+# An observed run turned "It is universally acknowledged as longer than the
+# Nile" into "The Nile is NOT universally acknowledged as the world's longest
+# river" — a complete reversal — and this gate passed it, because every
+# surviving word does appear in the source and the inserted 'not' was filtered
+# out before comparison. LOWERING THIS IS NOT THE FIX: it would flood the set
+# with articles and prepositions. Negation needed its own check, which is
+# ner.check_negation, and this constant is named here so the limitation is
+# visible at the point where it is created.
+MIN_CONTENT_WORD_LENGTH = 4
+
+# Suffixes stripped so that inflectional variants introduced by rewriting a
+# clause ('separates' vs 'separated') do not register as foreign material.
+# Order matters — longest first, first match wins.
+_STEM_SUFFIXES = ("ing", "es", "ed", "s")
+
+# A stem shorter than this is too mangled to compare, so the suffix is kept.
+# Without it, 'axes' would stem to 'ax' and collide with unrelated words.
+MIN_STEM_LENGTH = 4
+
+# ── How content words are normalised ──────────────────────────────────────────
+# "lemma_keep_propn"  spaCy lemma for ordinary words, proper nouns untouched.
+#                     Won every column of benchmarks/stemmer_bench.py.
+# "stem"              the previous behaviour — the four-suffix stripper above.
+#                     Kept as the comparison baseline: flip this back and re-run
+#                     the benchmark to reproduce the numbers rather than
+#                     trusting them.
+#
+# The stemming constants above apply in "stem" mode only.
+CONTENT_WORD_MODE = "lemma_keep_propn"
+
+
+def _content_words_lemma(text: str) -> set[str]:
+    """
+    Lemmatise ordinary words; leave proper nouns exactly as written.
+
+    WHY PART OF SPEECH IS THE MISSING INFORMATION. A stemmer is string rewriting
+    with no concept of a name, so any rule that strips a terminal 's' turns
+    every place name ending in -s into a plural: Paris->pari, Athens->athen,
+    Wales->wale. Fact-checking prose is dense with such names, and a mangled
+    name silently stops matching its own mention elsewhere.
+
+    No pure stemmer can do better — once the string is lowercased, 'Paris' and
+    'parries' are indistinguishable. The POS tag is what separates them, and
+    spaCy already computes it for this text.
+
+    The second gain is the opposite direction: lemmatisation collapses
+    inflectional variants a suffix stripper misses entirely, including
+    irregulars ('held'->'hold', 'built'->'build', 'went'->'go'), which is what
+    the faithfulness gate needs when the extractor rewrites a clause. Fewer
+    false rejections, so fewer wasted retries.
+
+    Cost is a parse (~1ms for a claim, ~20ms for a document) instead of a regex.
+    Against ~10-20s extraction calls that is not measurable, and
+    extract_atomic_facts parses the document once per request, not per claim.
+    """
+    doc = ner.NLP(text)
+
+    out: set[str] = set()
+    for token in doc:
+        if token.is_punct or token.is_space:
+            continue
+
+        surface = token.text.lower()
+        if len(surface) < MIN_CONTENT_WORD_LENGTH:
+            continue
+
+        # PROPN passes through untouched. This is the whole point: a name is not
+        # an inflected form of anything, so any normalisation of it is damage.
+        out.add(surface if token.pos_ == "PROPN" else token.lemma_.lower())
+
+    return out
+
+
 def _content_words(text: str) -> set[str]:
     """
-    Lowercase content words (>3 chars) of `text`, crudely stemmed.
+    Lowercase content words of `text`, crudely stemmed.
 
     Stemming is deliberately naive — it exists so that inflectional variants
     introduced by rewriting a clause into a standalone sentence ('separates'
     vs 'separated', 'prizes' vs 'prize') do not register as foreign material.
     It is not meant to be linguistically correct; it only needs to leave
     proper nouns and numbers untouched, which it does.
+
+    See MIN_CONTENT_WORD_LENGTH above for why this function is blind to
+    negation — a limitation, not an oversight, and one that has its own gate
+    (ner.check_negation) rather than a different threshold here.
+
+    CONTENT_WORD_MODE selects the implementation. The stemming path below is the
+    baseline the lemma path was measured against, not dead code: it is what
+    benchmarks/stemmer_bench.py compares, and deleting it would make the
+    comparison unreproducible.
     """
+    if CONTENT_WORD_MODE == "lemma_keep_propn":
+        return _content_words_lemma(text)
+
     words = re.findall(r"[a-zçğışöü0-9]+", text.lower())
     stemmed = set()
     for w in words:
-        if len(w) <= 3:
+        if len(w) < MIN_CONTENT_WORD_LENGTH:
             continue
-        for suffix in ("ing", "es", "ed", "s"):
-            if len(w) - len(suffix) >= 4 and w.endswith(suffix):
+        for suffix in _STEM_SUFFIXES:
+            if len(w) - len(suffix) >= MIN_STEM_LENGTH and w.endswith(suffix):
                 w = w[: -len(suffix)]
                 break
         stemmed.add(w)
@@ -424,19 +524,77 @@ def diagnose_nei(fact: str, chunks: list[str]) -> str:
     if not subject:
         return "UNKNOWN"
 
-    # Match on the subject's head word: retrieved prose says "the Bosporus",
-    # "Bosporus Strait", "Bosphorus" — requiring the full phrase would produce
-    # false negatives that look like retrieval failures.
-    head = subject.split()[-1].lower()
+    # Match on the subject's PROPER NOUN, falling back to its longest token.
+    #
+    # Requiring the whole phrase would produce false negatives that look like
+    # retrieval failures — retrieved prose says "the Bosporus", "Bosporus
+    # Strait", "Bosphorus" — so some single token has to stand in for the
+    # subject. Choosing WHICH token is the entire difficulty, and two previous
+    # answers were wrong:
+    #
+    #   split()[-1]            The head word. Too permissive when that head is a
+    #                          common noun: "Yavuz Sultan Selim Bridge" matched
+    #                          on 'bridge' against a passage comparing tower
+    #                          heights, and "water molecules" matched on
+    #                          'molecules' in an article about the properties of
+    #                          water. Both reported GENUINE; both were retrieval
+    #                          failures.
+    #
+    #   max(split(), key=len)  The longest token, as a proxy for the rarest. It
+    #                          fixes those two and then reproduces the same bug
+    #                          whenever a common noun is simply longer:
+    #
+    #                            'English settlement of Jamestown'
+    #                             English=7  settlement=10  Jamestown=9
+    #                             -> picks 'settlement'
+    #
+    #                          which matches almost any colonial-era passage, so
+    #                          the diagnosis is GENUINE by construction. Observed
+    #                          on a real run, where it happened to agree with the
+    #                          truth and therefore told the reader nothing.
+    #
+    # Length was never the property being reached for. The property is "does
+    # this string name ONE thing?", and part of speech answers it directly: a
+    # proper noun is a name, a common noun is a category. spaCy has already
+    # tagged this text, so the answer costs nothing. Length survives only as the
+    # fallback for subjects with no proper noun at all ("water molecules"),
+    # where the old proxy remains the best available.
+    #
+    # WHY THIS MATTERS BEYOND TIDINESS: GENUINE means "the right evidence was
+    # retrieved and is authentically silent", which is terminal — no better
+    # query will help. RETRIEVAL_FAILURE means "try again". Getting them the
+    # wrong way round tells the operator to stop looking at exactly the moment
+    # retrieval is what needs fixing.
+    subject_doc = ner.NLP(subject)
+    proper_nouns = [t.text for t in subject_doc if t.pos_ == "PROPN"]
+
+    if proper_nouns:
+        head = max(proper_nouns, key=len).lower()
+        basis = "proper noun"
+    else:
+        head = max(subject.split(), key=len).lower()
+        basis = "longest token (no proper noun in subject)"
+
     haystack = " ".join(chunks).lower()
 
+    # BOTH outcomes are logged. Only RETRIEVAL_FAILURE used to print, so a
+    # GENUINE diagnosis reached the reader through run()'s summary suffix — a
+    # different function than the one that made the decision. That made the
+    # diagnostic look disconnected from the pipeline when it was merely silent,
+    # and it hid which token the decision rested on, which is precisely what was
+    # wrong above.
     if head in haystack:
+        print(
+            f"[Diagnosis] Subject '{subject}' matched on '{head}' ({basis}) in "
+            f"{len(chunks)} evidence chunk(s) — the evidence IS about this claim, "
+            f"so NEI is a considered verdict."
+        )
         return "GENUINE"
 
     print(
-        f"[Diagnosis] Subject '{subject}' appears in 0 of {len(chunks)} evidence "
-        f"chunk(s) — the evidence is not about this claim. NEI is a retrieval "
-        f"failure, not a verdict."
+        f"[Diagnosis] Subject '{subject}' — '{head}' ({basis}) appears in 0 of "
+        f"{len(chunks)} evidence chunk(s). The evidence is not about this claim. "
+        f"NEI is a retrieval failure, not a verdict."
     )
     return "RETRIEVAL_FAILURE"
 

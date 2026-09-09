@@ -140,4 +140,43 @@ def test_num_predict_covers_the_thinking_budget():
     if verifier.VERIFIER_THINKING is False:
         assert verifier.VERIFIER_NUM_PREDICT >= 128
     else:
-        assert verifier.VERIFIER_NUM_PREDICT >= 512
+        # 1024 was the previous value and it was MEASURED to be too small: one
+        # run hit exactly 1024 and returned nothing, and verifier_probe measured
+        # 2063 tokens on a hard case. The floor is set above that measurement,
+        # not above a guess.
+        assert verifier.VERIFIER_NUM_PREDICT >= 2048
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Truncation is not a verdict
+# ═════════════════════════════════════════════════════════════════════════════
+def test_truncated_generation_is_reported_as_a_failure(monkeypatch):
+    """
+    Generation that dies inside <think> leaves an empty string after stripping,
+    and the parser's default is NOT ENOUGH INFO. Observed: 267 seconds, an empty
+    raw response, a blank rationale, and a reported NEI that was indistinguish-
+    able from the two genuine NEI verdicts in the same run.
+
+    The label still has to be one of the three FEVER values — the frontend and
+    the aggregator have no fourth — so the rationale is what must carry the
+    truth. Assert on the rationale, because that is the only channel that can.
+    """
+    monkeypatch.setattr(verifier, "call_ollama", lambda _prompt: "")
+
+    result = verifier.verify("Some claim.", ["Some evidence chunk."])
+
+    assert "VERIFIER FAILURE" in result.rationale
+    assert "unchecked" in result.rationale.lower()
+
+
+def test_a_real_label_is_not_mistaken_for_truncation(monkeypatch):
+    """The guard must not fire on a well-formed answer."""
+    monkeypatch.setattr(
+        verifier, "call_ollama",
+        lambda _prompt: "LABEL: SUPPORTS\nEVIDENCE: 1\nRATIONALE: It says so.",
+    )
+
+    result = verifier.verify("Some claim.", ["Some evidence chunk."])
+
+    assert result.label == "SUPPORTS"
+    assert "VERIFIER FAILURE" not in result.rationale

@@ -6,12 +6,12 @@
 #
 # What does NOT belong here:
 # Pipeline-specific constants that are only ever read by one module
-# (e.g., CHUNK_SIZE in chunker.py, TOP_K_CHUNKS in retriever.py,
-# ENTITY_PRIORITY in ner.py) stay in their own files. Centralising them
-# here would create an invisible coupling: a reader of chunker.py would
-# have to open config.py to understand chunking behavior, and a change
-# to config.py could silently affect a module the editor didn't intend
-# to touch. Single-module constants belong with their module.
+# (e.g., CHUNK_SIZE and TOP_K_CHUNKS in retriever.py, ENTITY_PRIORITY in
+# ner.py) stay in their own files. Centralising them here would create an
+# invisible coupling: a reader of retriever.py would have to open config.py
+# to understand chunking behavior, and a change to config.py could silently
+# affect a module the editor didn't intend to touch. Single-module constants
+# belong with their module.
 #
 # Import pattern for all pipeline modules:
 #     from config import OLLAMA_BASE_URL, FAST_MODEL, REASONING_MODEL, MAX_INPUT_WORDS
