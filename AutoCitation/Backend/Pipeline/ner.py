@@ -465,7 +465,22 @@ def check_worthy(claim: str) -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2b — Grammatical Subject Recovery
 # ─────────────────────────────────────────────────────────────────────────────
-_LEADING_ARTICLE = re.compile(r'^(the|a|an)\s+', re.IGNORECASE)
+# Determiners and quantifiers stripped from the front of a recovered subject.
+#
+# Was just (the|a|an), which let this through:
+#
+#     "Both Python and C++ are widely used..."  ->  subject 'Both Python'
+#                                               ->  query   'Both Python C++'
+#
+# 'Both' is a predeterminer attached to the subject, so it lands inside the
+# subject's subtree and survives into the search string. Wikipedia has no
+# article about Both Python. These words quantify a noun phrase without naming
+# anything, so none of them belongs in a query — and unlike the input character
+# allowlist, this IS a closed class worth enumerating.
+_LEADING_ARTICLE = re.compile(
+    r'^(the|a|an|both|all|each|every|either|neither|some|any|this|that|these|those)\s+',
+    re.IGNORECASE,
+)
 
 # Dependency relations that hang extra CLAUSES or alternatives off a noun.
 # They belong to the sentence, not to the entity's name, and dragging them into
@@ -857,6 +872,12 @@ def extract_queries(fact: str, max_queries: int = 3) -> list[str]:
     entities = extract_entities(fact)
     filtered = filter_entities(entities)
 
+    # Captured BEFORE subject promotion, which unconditionally puts the subject
+    # into `filtered` and would make "did NER find anything?" unanswerable
+    # afterwards. The bare-head fallback at the end of this function needs the
+    # answer.
+    filtered_entities_found = bool(filtered)
+
     # SUBJECT PROMOTION: whatever the claim is *about* must reach the index.
     #
     # The subject is MOVED to the front, not merely inserted when absent. The
@@ -921,6 +942,29 @@ def extract_queries(fact: str, max_queries: int = 3) -> list[str]:
     # other queries cannot ask is not the thing the cap is protecting against.
     # Cost is one Wikipedia fetch (~5-15s) against verifications that run
     # 100-600s.
+    # BARE-HEAD FALLBACK for a multi-word subject when NER found nothing.
+    #
+    #     "Standard C++ relies primarily on manual memory management..."
+    #     entities: []            (NER recognised nothing at all)
+    #     query:    'Standard C++'
+    #     result:   the C STANDARD LIBRARY article — wrong language
+    #
+    # diagnose_nei caught it correctly ("'c++' appears in 0 of 2 chunks"), but
+    # nothing recovered. With no entities there was exactly one query, and one
+    # bad query is a lost claim.
+    #
+    # The head token alone — 'C++' — retrieves the right article. Adding it
+    # costs one fetch and only when NER produced nothing, so the common case is
+    # untouched. This is a fallback for a recogniser that failed, not a general
+    # query strategy: 'Standard' is doing no work here, and when NER is
+    # working the entity list already carries the name.
+    if subject and not filtered_entities_found and len(subject.split()) > 1:
+        head_token = _sanitize_query(subject.split()[-1])
+        if head_token and head_token not in queries and len(head_token) > 1:
+            print(f"[NER] NER found no entities — adding bare head '{head_token}' "
+                  f"as a fallback query.")
+            queries.append(head_token)
+
     predicate_query = build_predicate_query(fact)
     if predicate_query and predicate_query not in queries:
         queries.append(predicate_query)

@@ -4,6 +4,7 @@ import time
 import requests
 
 import Pipeline.ner as ner
+import Pipeline.program as program
 import Pipeline.retriever as retriever
 import Pipeline.verifier as verifier
 
@@ -207,17 +208,71 @@ text_ba = "Here is a 500-word text..."   # keep your original text here
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 0 — Precondition (your original function, unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
+# Maximum input length. A genuine resource guard: every sentence costs one or
+# more LLM calls, so an unbounded input is an unbounded request.
+MAX_INPUT_WORDS = 500
+
+# CONTROL CHARACTERS ONLY — a denylist, not an allowlist.
+#
+# This was an ALLOWLIST of "acceptable" characters:
+#
+#     r'^[a-zA-ZçğışöüÇĞİŞÖÜ0-9\s.,!?\-\'\"()]+$'
+#
+# and it silently rejected this input:
+#
+#     "Both Python and C++ are widely used object-oriented programming
+#      languages..."
+#
+# because of the '+' in C++. The request returned in 0.00s having read nothing,
+# and the API reported "no verifiable claims could be extracted" — an
+# explanation that was not merely unhelpful but FALSE, since the text was never
+# examined.
+#
+# The allowlist was unfixable in principle, not just incomplete. It also
+# rejected percentages, ratios written with '/', colons, semicolons, en-dashes,
+# curly quotes from any word processor, chemical formulae, mathematical notation
+# and every non-Latin script. Enumerating the characters that may appear in a
+# true statement about the world is not a finite task.
+#
+# Nothing downstream needed the protection either. The text goes to an LLM,
+# which reads arbitrary characters, and to Wikipedia search, where
+# ner._sanitize_query already strips the characters that break query parsers.
+# What genuinely does not belong in a claim is a C0 control character — a NUL,
+# a bell, an escape — which cannot appear in prose and can corrupt a log or a
+# terminal. That is a short, closed list, so it is the one worth writing down.
+_CONTROL_CHARACTERS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def validate_input(text: str) -> str | None:
+    """
+    Why this text cannot be processed, or None when it can.
+
+    SPLIT OUT SO THE CALLER CAN TELL THE DIFFERENCE. precondition() returns None
+    on rejection, run() then returns [], and main.py reported that as "no
+    verifiable claims could be extracted" — conflating "this input was refused"
+    with "this input was read and contained nothing checkable". Those are
+    opposite situations: one is the user's to fix, the other is a finding about
+    their text.
+    """
+    if not text or not text.strip():
+        return "the input is empty"
+
+    if len(text.split()) > MAX_INPUT_WORDS:
+        return (f"the input is {len(text.split())} words, over the "
+                f"{MAX_INPUT_WORDS}-word limit")
+
+    if _CONTROL_CHARACTERS.search(text):
+        return "the input contains control characters"
+
+    return None
+
+
 def precondition(text):
     text = re.sub(r'\s+', ' ', text).strip()
 
-    words = text.split(' ')
-    if len(words) > 500:
-        print("Validation Failed: Text exceeds 500 words.")
-        return None
-
-    allowed_pattern = r'^[a-zA-ZçğışöüÇĞİŞÖÜ0-9\s.,!?\-\'\"()]+$'
-    if not re.match(allowed_pattern, text):
-        print("Validation Failed: Text contains invalid characters.")
+    reason = validate_input(text)
+    if reason is not None:
+        print(f"Validation Failed: {reason}.")
         return None
 
     print(f"Preprocessed text: {text}")
@@ -617,6 +672,23 @@ def grounded_verify(fact: str) -> dict:
 
     Returns a complete per-fact result dict ready for postprocessor.process().
     """
+    # PROGRAM-GUIDED PATH FIRST, for the two claim types single-shot
+    # verification cannot decide — superlatives and comparatives. See
+    # Pipeline/program.py for why those two are different in kind rather than
+    # merely harder.
+    #
+    # Returns None for everything else, which is most claims, so the ordinary
+    # path below is unchanged for them. It also returns None when its own
+    # preconditions fail (no subject, no category query, execution error), so a
+    # claim can never be lost to this branch.
+    t_prog = time.perf_counter()
+    program_result = program.try_verify(fact)
+    if program_result is not None:
+        program_s = time.perf_counter() - t_prog
+        program_result["timings"]["verification_s"] = round(program_s, 2)
+        print(f"[Timing] program: {program_s:.2f}s — '{fact[:60]}'")
+        return program_result
+
     t0 = time.perf_counter()
     evidence_pack = retriever.fetch(fact)
     retrieval_s = time.perf_counter() - t0

@@ -133,6 +133,54 @@ def build_verification_prompt(fact: str, evidence_chunks: list[str]) -> str:
     Presents the fact and all evidence chunks to the reasoning model.
     Instructs it to select the most relevant chunk and judge the fact against it.
 
+    RULE 4 SEPARATES SYNONYMY FROM FACT-SUPPLY. The original wording was "Do not
+    use your internal knowledge — base your judgment solely on the evidence
+    provided", which the model obeyed to the letter:
+
+        claim    "Python uses AUTOMATIC garbage collection for memory management."
+        evidence "...an extensive standard library, and garbage collection."
+        verdict  NOT ENOUGH INFO
+        reason   "...does not EXPLICITLY state that it is automatic"
+
+    Garbage collection is automatic by definition — that is what distinguishes
+    it from manual memory management — but knowing so is knowledge the evidence
+    does not contain, so the rule forbade it. The model was not being careless;
+    it was being obedient, and the instruction was wrong.
+
+    The asymmetry that identifies the cause: the same model happily infers
+    "founded on May 14, 1607" |= "founded in May 1607", which is equally an
+    inference beyond the literal text. It does that one because it is
+    arithmetic, and refuses the other because it needs to know what a term
+    means. So the problem was never over-caution in general — it was the ban on
+    word meanings specifically.
+
+    Rule 4 now permits synonymy and still forbids adding information. Rule 6
+    blocks the case where synonymy would be dangerous — a narrower group
+    standing in for a wider one — so "English is a kind of European, therefore
+    first-English is first-European" cannot return through this door.
+
+    TWO EXAMPLES, ONE PER HALF OF THE RULE. The rule permits one thing and
+    forbids another, and a single example would demonstrate only whichever half
+    it illustrated — leaving the model to infer the boundary, which is exactly
+    the inference it has already shown it gets wrong in both directions.
+
+        helical stair / spiral staircase   SUPPORTS      meaning, not addition
+        architect's nationality            NOT ENOUGH    addition, not meaning
+
+    Both use the same invented subject, so the only thing that varies between
+    them is the kind of step being asked for. The entities are invented for
+    this purpose: a worked example drawn from the evaluation set would show the
+    model the answer to a question it is about to be asked, and that case would
+    then measure nothing. 'Marlow Tower' in rule 6 is deliberately a different
+    structure from this lighthouse, so the two rules cannot be confused for
+    variations of one example.
+
+    THE PROMPT IS NOW LONG. Rules 4 and 6 both carry two worked examples and the
+    whole thing runs to roughly 600 words. That is the cost side of a trade this
+    project has already paid once: a withdrawn rule 7 failed partly because
+    seven unordered instructions competed for attention. If a future rule earns
+    its place, something here should lose its examples first.
+
     RULE 6 IS THE OVER-REFUTATION FIX. Observed:
 
         claim    "The title of the world's longest river belongs to the Amazon."
@@ -156,6 +204,24 @@ def build_verification_prompt(fact: str, evidence_chunks: list[str]) -> str:
     because 'disputed' is the textbook NOT ENOUGH INFO signal and nothing in
     this prompt had ever said so — rule 5 covers chunks contradicting EACH
     OTHER, not a single chunk reporting an open question.
+
+    ITS SUPPORTS CLAUSE IS LOAD-BEARING, MEASURED. Run twice over five probe
+    cases, once with the clause and once with verifier_probe's
+    --no-supports-clause ablation:
+
+        with     4/5      jamestown_nationality -> NOT ENOUGH INFO  (correct)
+        without  3/5      jamestown_nationality -> SUPPORTS         (the bug)
+
+    It was also suspected of causing the python_gc regression above. It did not:
+    that case failed identically with and without, which is what redirected the
+    investigation to rule 4. Do not remove this clause on the theory that it
+    over-fires; that theory has been tested and is false.
+
+    It is expensive, though, and the cost belongs next to the benefit. On
+    jamestown_nationality the clause took the model from 192 words of reasoning
+    to 1386, and 92s to 484s — roughly doubling verification time across the
+    whole probe set. The extra deliberation is where the correct verdict comes
+    from, so this is a real accuracy-for-latency trade rather than waste.
 
     VALIDATED BY verifier_probe.py before shipping, on four cases: the disputed
     river (now NOT ENOUGH INFO, was REFUTES) plus two controls that must not
@@ -219,7 +285,23 @@ Instructions:
 1. Read all evidence chunks carefully.
 2. Identify which single evidence chunk is most relevant to verifying the claim.
 3. Based strictly on that chunk, determine the verification label.
-4. Do not use your internal knowledge — base your judgment solely on the evidence provided.
+4. Do not supply FACTS from your internal knowledge — every factual judgment must
+   come from the evidence. You MAY use ordinary knowledge of what words mean: if
+   the evidence states in different words something that MEANS the same as the
+   claim, that is support. What you may not do is add information the evidence
+   does not contain.
+
+   Claim:    "The lighthouse has a spiral staircase inside."
+   Evidence: "Visitors ascend the lighthouse by a helical stair."
+   CORRECT   SUPPORTS — a helical stair and a spiral staircase are one thing
+             under two names, and recognising that is reading, not adding.
+   WRONG     NOT ENOUGH INFO — the evidence does not use the word 'spiral'.
+
+   Claim:    "The lighthouse was designed by a Belgian architect."
+   Evidence: "The lighthouse was designed by Anton Meeus."
+   CORRECT   NOT ENOUGH INFO — nothing here says where Meeus was from.
+   WRONG     SUPPORTS — supplying the architect's nationality from memory adds
+             a fact the evidence does not contain.
 5. If the evidence chunks contradict each other on the point in question, or none of them directly addresses the claim's subject, output NOT ENOUGH INFO rather than guessing.
 6. REFUTES REQUIRES A CONTRADICTION, NOT AN ABSENCE OF CONFIRMATION. Output
    REFUTES only when a chunk states something that CANNOT BE TRUE AT THE SAME

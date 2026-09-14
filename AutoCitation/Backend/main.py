@@ -112,6 +112,12 @@ class CheckResponse(BaseModel):
     # plus total_s — wall-clock time for the whole request.
     timings       : dict[str, float] = {}
 
+    # Optional human-readable explanation, populated only when the outcome needs
+    # one. A response with zero claims is otherwise indistinguishable from a
+    # response the user should have got claims for, and "0 results" with no
+    # reason is the least useful thing an API can say.
+    message       : str | None = None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2 — Application Lifespan (Startup Checks)
@@ -255,6 +261,25 @@ def check(request: CheckRequest) -> CheckResponse:
     print(f"\n[Main] POST /check — received {len(request.text.split())} words.")
     t_start = time.perf_counter()
 
+    # REFUSED INPUT IS NOT AN EMPTY RESULT.
+    #
+    # precondition() returns None on rejection and run() then returns [], which
+    # this endpoint reported as "no verifiable claims could be extracted". An
+    # observed request containing "C++" was refused by a character allowlist and
+    # answered in 0.00s with that message — describing text the pipeline had
+    # never read. The user is told their writing is unverifiable when in fact it
+    # was never examined.
+    #
+    # 400 because the caller can act on it; the zero-claim path below stays 200
+    # because there the caller did nothing wrong.
+    rejection = claim_extractor.validate_input(request.text)
+    if rejection is not None:
+        print(f"[Main] Input rejected — {rejection}.")
+        raise HTTPException(
+            status_code = 400,
+            detail      = f"Input could not be processed because {rejection}.",
+        )
+
     # ── Stage 1+2: Claim Extraction with Grounded Verification ───────────────
     # claim_extractor.run() returns fully verified per-fact result dicts
     # (claim, label, rationale, evidence, ner_query, source_url) — retrieval
@@ -278,18 +303,39 @@ def check(request: CheckRequest) -> CheckResponse:
         # correctly answered with "no verifiable claims found". Returning 200
         # with an empty claim list lets the UI say that, and keeps genuine
         # 5xx codes meaningful for genuine outages.
-        print("[Main] No verifiable claims extracted — returning empty result set.")
+        # THE KEYS HERE MUST MATCH CheckResponse. They did not, and FastAPI
+        # answered a perfectly ordinary "nothing to check" outcome with a 500:
+        #
+        #   ResponseValidationError: 2 validation errors
+        #     ('response', 'total_claims')  Field required
+        #     ('response', 'results')       Field required
+        #
+        # This branch returned 'claims' and 'elapsed_s' where the model declares
+        # 'results' and 'timings'. Nothing catches that mismatch until the branch
+        # is actually taken, because response_model validation only runs on a
+        # response that exists — and the happy path builds its dict in
+        # postprocessor.aggregate(), which does use the right names. So the two
+        # exits from this endpoint had drifted into different shapes and only one
+        # of them was ever exercised.
+        #
+        # Hence test_empty_result_matches_the_response_model in Tests/main_test.py.
         elapsed = time.perf_counter() - t_start
+        reason = (
+            "No verifiable claims could be extracted from the input. This "
+            "happens when the text is opinion rather than fact, when its "
+            "statements depend on context the text does not supply, or when "
+            "the input failed preprocessing — check the console for a "
+            "'Validation Failed' line."
+        )
+        print(f"[Main] No verifiable claims extracted ({elapsed:.2f}s) — "
+              f"returning empty result set.")
         return {
-            "claims"        : [],
+            "total_claims"  : 0,
             "overall_label" : "NO CLAIMS",
             "summary"       : {"SUPPORTS": 0, "REFUTES": 0, "NOT ENOUGH INFO": 0},
-            "message"       : (
-                "No verifiable claims could be extracted from the input. This "
-                "happens when the text is opinion rather than fact, or when its "
-                "statements depend on context the text does not supply."
-            ),
-            "elapsed_s"     : round(elapsed, 2),
+            "results"       : [],
+            "timings"       : {"total_s": round(elapsed, 2)},
+            "message"       : reason,
         }
 
     print(f"[Main] {len(pipeline_outputs)} verified fact(s) extracted.")
